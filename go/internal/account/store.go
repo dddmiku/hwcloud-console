@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"hwcloud/internal/config"
+	"hwcloud/internal/textutil"
 	"hwcloud/internal/fsutil"
 )
 
@@ -19,6 +20,13 @@ type Account struct {
 	ID       string `json:"id"`        // 目录名，通常是手机号
 	Phone    string `json:"phone"`
 	Password string `json:"password,omitempty"` // 明文存储，仅本机使用
+
+	// Remark 是用户自定义的备注，用来区分多个账号。
+	//
+	// 为什么需要：账号多了以后，光看手机号根本分不清哪个是主号、
+	// 哪个是测试号、哪个属于哪个项目。备注让用户自己打标签。
+	// 纯展示用，不参与任何业务逻辑。
+	Remark string `json:"remark,omitempty"`
 
 	// 设备信任相关
 	HwidCasSid string `json:"hwid_cas_sid,omitempty"`
@@ -166,7 +174,10 @@ func (s *Store) Get(id string) (*Account, bool) {
 
 // Add 新增账号。
 func (s *Store) Add(phone, password string) (*Account, error) {
-	phone = strings.TrimSpace(phone)
+	// 兜底清洗：即使调用方漏了，也别把带不可见字符的凭据存进来。
+	// 存进去之后每次登录都会失败，而界面上看不出任何异常。
+	phone = textutil.CleanPhone(phone)
+	password = textutil.CleanPassword(password)
 	if phone == "" {
 		return nil, fmt.Errorf("手机号不能为空")
 	}
