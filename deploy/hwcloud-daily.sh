@@ -36,13 +36,28 @@ fi
 log "=== 每日任务开始 ==="
 overall=0
 
-for d in /opt/hwcloud-demo/accounts/*/; do
-    acc=$(basename "$d")
-    # 没有 cookies.json 的是未完成登录的残留目录
-    if [ ! -f "$d/state/cookies.json" ]; then
-        log "[$acc] 跳过（无 cookies.json，未完成登录）"
-        continue
-    fi
+# 账号顺序随机化 + 每账号随机延时。
+# 原因见 hwcloud-lib.sh：固定顺序是明显的机器特征，
+# 同一秒四个账号齐发也是。手动运行（HWCLOUD_MANUAL=1）不加延时。
+#
+# 找 lib 的顺序：脚本同目录 → /usr/local/bin → deploy 目录。
+# 为什么不止同目录：systemd 执行的是 /usr/local/bin/hwcloud-daily.sh，
+# 而开发时改的是 /opt/hwcloud-demo/deploy/ 下的副本，两边都要能找到。
+for _lib in "$(dirname "$0")/hwcloud-lib.sh" \
+            /usr/local/bin/hwcloud-lib.sh \
+            /opt/hwcloud-demo/deploy/hwcloud-lib.sh; do
+    [ -f "$_lib" ] && { . "$_lib"; break; }
+done
+if ! command -v random_accounts >/dev/null 2>&1; then
+    log "WARN: 找不到 hwcloud-lib.sh，退回固定顺序（无随机延时）"
+    random_accounts() { for d in /opt/hwcloud-demo/accounts/*/; do
+        [ -f "$d/state/cookies.json" ] && basename "$d"; done; }
+    random_delay() { :; }
+fi
+
+for acc in $(random_accounts); do
+    d="/opt/hwcloud-demo/accounts/$acc"
+    random_delay "$acc"
 
     # 先把会话拉起来（离线会自动账密登录）
     HWCLOUD_ACCOUNT="$acc" "$BIN" keepalive --auto-login >/tmp/ka.$$ 2>&1
