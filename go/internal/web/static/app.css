@@ -236,9 +236,14 @@ a.btn{display:inline-flex;align-items:center;justify-content:center;text-decorat
   border:1px solid var(--border);
 }
 .remark-input{
-  flex:1 1 220px;min-width:0;
+  /* 不要 flex:1 —— 撑满整行会把按钮推到卡片最右边，
+     视觉上和输入框断开，用户以为按钮是另一回事。
+     固定宽度，按钮紧跟其后。 */
+  flex:0 1 320px;max-width:320px;min-width:140px;
   padding:7px 10px;border-radius:6px;
   border:1px solid var(--border);background:var(--input-bg,#fff);
   color:inherit;font-size:13px;
 }
 .remark-input:focus{outline:none;border-color:var(--accent)}
+
+.remark-editor{justify-content:flex-start}
