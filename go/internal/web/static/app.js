@@ -333,8 +333,14 @@ function remarkChip(a){
 // 用 prompt 不行（artifact 环境里被禁用），所以直接在卡片上方
 // 插一个输入行，回车保存、Esc 取消。
 function editRemark(id){
-  const card = document.querySelector('.acc[data-id="' + CSS.escape(id) + '"]');
-  if(!card) return;
+  // 用属性选择器 + 转义双引号，不用 CSS.escape（老浏览器没有这个 API）。
+  // 账号 id 是手机号，不会含引号，但转义一下更稳。
+  const safe = String(id).replace(/"/g, '\\"');
+  const card = document.querySelector('.acc[data-id="' + safe + '"]');
+  if(!card){
+    showMsg('globalMsg', '找不到账号卡片，请刷新页面', false);
+    return;
+  }
   if(card.querySelector('.remark-editor')) return;  // 已经开着
 
   const a = accounts.find(x => x.id === id);
@@ -498,7 +504,10 @@ function bindAccountActions(){
   list.dataset.bound = '1';
 
   list.addEventListener('click', (ev) => {
-    const btn = ev.target.closest('button[data-act]');
+    // 注意：这里不能用 button[data-act] —— 备注徽标是 <span>，
+    // 用 button 限定会让它点不动。统一用 [data-act]，
+    // 具体元素类型由渲染方决定。
+    const btn = ev.target.closest('[data-act]');
     if(!btn || btn.disabled) return;
     const act = btn.dataset.act;
     const arg = btn.dataset.arg || '';
