@@ -413,6 +413,108 @@ func clickIssueSubmit(page playwright.Page) error {
 //     input[placeholder="请填写用户名/邮箱"]
 //     input[placeholder="请填写密码"]
 //     button "登 录"
+// FetchGitCodeUsername 从已保存的 GitCode 会话里读真实用户名。
+//
+// 为什么需要：GitCode **允许用手机号/邮箱登录**，所以用户在面板里
+// 填手机号也能登录成功。但华为云的绑定接口要的是**用户名**
+// （gitcode.com/<用户名> 里那段），传手机号会 404：
+//
+//	{"error":"gitcode user not found","username":"13005999962"}
+//
+// 用户名在好几个地方都有，最稳的是账号设置页：
+//
+//	https://gitcode.com/setting/account
+//
+// 页面上显示 "@wqa12130" 这样的文本，侧栏也有裸用户名。
+// 这样用户只需填手机号+密码就能登录，用户名自动取，
+// 不用他再去个人主页复制一遍。
+//
+// 返回的用户名**不带 @ 前缀** —— 华为云绑定接口要的是裸用户名。
+func FetchGitCodeUsername() (string, error) {
+	if err := browser.EnsureDriver(); err != nil {
+		return "", err
+	}
+	pw, err := playwright.Run()
+	if err != nil {
+		return "", err
+	}
+	defer pw.Stop()
+
+	state := config.GitCodeStateFile()
+	if _, err := os.Stat(state); err != nil {
+		return "", fmt.Errorf("未找到 GitCode 会话，请先登录")
+	}
+
+	br, ctx, err := browser.NewStorageContextUA(pw, state, true, config.DefaultUA)
+	if err != nil {
+		return "", err
+	}
+	defer br.Close()
+	defer ctx.Close()
+
+	page, err := ctx.NewPage()
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := page.Goto("https://gitcode.com/setting/account", playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(45000),
+	}); err != nil {
+		return "", err
+	}
+	// 页面是 Vue 应用，@用户名要等 JS 渲染
+	for i := 0; i < 20; i++ {
+		page.WaitForTimeout(700)
+		if n, err := page.Locator(`text=/^@[a-zA-Z0-9_-]+$/`).Count(); err == nil && n > 0 {
+			break
+		}
+	}
+
+	raw, err := page.Evaluate(`() => {
+		const hits = [];
+		document.querySelectorAll('*').forEach(el => {
+			if (el.children.length > 2) return;          // 只看叶子节点
+			const t = (el.innerText || '').trim();
+			const m = t.match(/^@([a-zA-Z0-9_-]{2,40})$/);
+			if (m) hits.push(m[1]);                       // 只取 @ 后面的部分
+		});
+		if (hits.length) return hits[0];
+
+		// 兜底：账号设置页侧栏直接显示裸用户名。
+		// 限定在 setting/account 页面，避免在别的页面误抓导航文字。
+		if (!location.pathname.includes('/setting/account')) return '';
+		const cands = [];
+		document.querySelectorAll('div,span,a').forEach(el => {
+			if (el.children.length > 0) return;
+			const t = (el.innerText || '').trim();
+			if (/^[a-zA-Z0-9_-]{3,40}$/.test(t)) cands.push(t);
+		});
+		return cands.length ? cands[0] : '';
+	}`)
+	if err != nil {
+		return "", err
+	}
+	name, _ := raw.(string)
+	// 兜底再剥一次 @：万一页面结构变化让 @ 混进来
+	name = strings.TrimPrefix(strings.TrimSpace(name), "@")
+	if name == "" {
+		dump, _ := page.Locator("body").InnerText()
+		return "", fmt.Errorf("没能从账号设置页读到用户名（URL: %s）。页面开头：%s",
+			page.URL(), firstRunes(dump, 120))
+	}
+	return name, nil
+}
+
+// firstRunes 取字符串前 n 个 rune（避免按字节截断中文）。
+func firstRunes(s string, n int) string {
+	rs := []rune(s)
+	if len(rs) <= n {
+		return string(rs)
+	}
+	return string(rs[:n])
+}
+
 func LoginGitCodeAuto(account, password string, timeoutSec int) (map[string]any, error) {
 	if err := browser.EnsureDriver(); err != nil {
 		return nil, err
