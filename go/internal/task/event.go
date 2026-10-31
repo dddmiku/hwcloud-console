@@ -191,6 +191,24 @@ func RunEventTask(opts EventOptions) (map[string]any, error) {
 	}
 	page.WaitForTimeout(9000)
 
+	// 点击「立即报名」会**打开新标签页**跳到 raceEnrollment/<id>，
+	// 原页面不动。早先的代码继续用原来的 page，于是：
+	//   - enrollURL 拿到的是列表页地址
+	//   - 后面所有表单操作都在列表页上找，必然报「找不到 请选择职业」
+	//
+	// 这里把新标签页接过来。找不到新页面就退回原页面
+	// （某些赛事可能改成同页弹窗）。
+	if pages := ctx.Pages(); len(pages) > 1 {
+		enrollPage := pages[len(pages)-1]
+		_ = enrollPage.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+			State: playwright.LoadStateDomcontentloaded,
+		})
+		enrollPage.WaitForTimeout(3000)
+		if strings.Contains(enrollPage.URL(), "raceEnrollment") {
+			page = enrollPage
+		}
+	}
+
 	enrollURL := page.URL()
 	fmt.Printf("[*] 报名页: %s\n", enrollURL)
 
