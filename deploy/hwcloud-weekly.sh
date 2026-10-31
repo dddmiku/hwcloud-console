@@ -33,12 +33,23 @@ fi
 log "=== 每周任务开始 ==="
 overall=0
 
-for d in /opt/hwcloud-demo/accounts/*/; do
-    acc=$(basename "$d")
-    if [ ! -f "$d/state/cookies.json" ]; then
-        log "[$acc] 跳过（无 cookies.json，未完成登录）"
-        continue
-    fi
+# 账号顺序随机化 + 每账号随机延时，见 hwcloud-lib.sh。
+# 周常比日常更重（要开浏览器报名赛事），延时的上限也放宽一些。
+for _lib in "$(dirname "$0")/hwcloud-lib.sh" \
+            /usr/local/bin/hwcloud-lib.sh \
+            /opt/hwcloud-demo/deploy/hwcloud-lib.sh; do
+    [ -f "$_lib" ] && { . "$_lib"; break; }
+done
+if ! command -v random_accounts >/dev/null 2>&1; then
+    log "WARN: 找不到 hwcloud-lib.sh，退回固定顺序（无随机延时）"
+    random_accounts() { for d in /opt/hwcloud-demo/accounts/*/; do
+        [ -f "$d/state/cookies.json" ] && basename "$d"; done; }
+    random_delay() { :; }
+fi
+
+for acc in $(random_accounts); do
+    d="/opt/hwcloud-demo/accounts/$acc"
+    random_delay "$acc" 240
 
     HWCLOUD_ACCOUNT="$acc" "$BIN" keepalive --auto-login >/tmp/kaw.$$ 2>&1
     if [ $? -ne 0 ]; then
