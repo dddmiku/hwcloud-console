@@ -316,6 +316,75 @@ async function autoProbeBindStates(){
   }
 }
 
+// remarkChip 渲染备注徽标。没备注时显示一个淡淡的「+备注」提示，
+// 让用户知道这个位置可以点。
+function remarkChip(a){
+  const id = esc(a.id);
+  if(a.remark){
+    return '<span class="acc-remark" data-act="remark" data-arg="' + id +
+           '" title="点击修改备注">' + esc(a.remark) + '</span>';
+  }
+  return '<span class="acc-remark empty" data-act="remark" data-arg="' + id +
+         '" title="给这个账号加个备注">+ 备注</span>';
+}
+
+// editRemark 编辑账号备注。
+//
+// 用 prompt 不行（artifact 环境里被禁用），所以直接在卡片上方
+// 插一个输入行，回车保存、Esc 取消。
+function editRemark(id){
+  const card = document.querySelector('.acc[data-id="' + CSS.escape(id) + '"]');
+  if(!card) return;
+  if(card.querySelector('.remark-editor')) return;  // 已经开着
+
+  const a = accounts.find(x => x.id === id);
+  const head = card.querySelector('.acc-head');
+  if(!head) return;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'remark-editor';
+  wrap.innerHTML =
+    '<input class="remark-input" maxlength="40" placeholder="给这个账号起个名字，比如「主号」「测试」「项目A」">' +
+    '<button class="btn sm primary" data-r="save">保存</button>' +
+    '<button class="btn sm" data-r="cancel">取消</button>';
+  head.parentElement.insertBefore(wrap, head.nextSibling);
+
+  const input = wrap.querySelector('.remark-input');
+  input.value = (a && a.remark) || '';
+  input.focus();
+  input.select();
+
+  const close = () => wrap.remove();
+
+  const save = async () => {
+    const val = input.value.trim();
+    try{
+      const r = await api('/api/accounts/remark', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({id, remark: val})
+      });
+      if(r.error) throw new Error(r.error);
+      if(a) a.remark = r.remark || '';
+      close();
+      $('accList').innerHTML = accounts.map(x => renderAccount(x)).join('');
+    }catch(e){
+      showMsg('globalMsg', '保存备注失败：' + e.message, false);
+    }
+  };
+
+  wrap.addEventListener('click', ev => {
+    const b = ev.target.closest('[data-r]');
+    if(!b) return;
+    if(b.dataset.r === 'save') save();
+    else close();
+  });
+  input.addEventListener('keydown', ev => {
+    if(ev.key === 'Enter'){ ev.preventDefault(); save() }
+    if(ev.key === 'Escape'){ ev.preventDefault(); close() }
+  });
+  // 失焦不自动关闭 —— 用户可能只是点到别处看一眼
+}
+
 function renderAccount(a){
   const alive = a.alive === true;
   const status = alive
@@ -353,6 +422,8 @@ function renderAccount(a){
 
   return '<div class="acc" data-id="' + esc(a.id) + '">' +
     '<div class="acc-head">' +
+      // 备注放最前面，比手机号更醒目 —— 账号多了以后用户靠备注认号
+      remarkChip(a) +
       '<span class="acc-phone">' + esc(a.phone) + '</span>' +
       (a.username ? '<span class="acc-user">' + esc(a.username) + '</span>' : '') +
       '<span class="spacer"></span>' +
@@ -441,6 +512,7 @@ function bindAccountActions(){
         runTask(id, arg);
         break;
       case 'gitcode': openGitCode(arg || id); break;
+      case 'remark': editRemark(arg || id); break;
       case 'check':    checkAccount(id); break;
       case 'tasks':    showTasks(id); break;
       case 'remove':   removeAccount(id); break;
@@ -1342,7 +1414,7 @@ async function saveGitCode(){
     //    登录（拿到 gitcode.com 会话）和绑定（华为云侧的关联记录）
     //    是两件完全不同的事。
     showMsg('gcMsg', '✓ GitCode 登录成功，正在绑定到华为云…', true);
-    let bindOK = false, bindMsg = '';
+    let bindOK = false, bindMsg = '', needUsername = false;
     try{
       const r3 = await api('/api/accounts/run?id=' + encodeURIComponent(gcAccountId) + '&name=bindgitcode',
                            {method: 'POST', timeoutMs: 120000});
@@ -1350,6 +1422,7 @@ async function saveGitCode(){
         bindOK = true;
       }else{
         bindMsg = (r3 && r3.error) || '绑定未生效';
+        needUsername = !!(r3 && r3.need_username);
       }
     }catch(be){
       bindMsg = be.message;
@@ -1370,6 +1443,11 @@ async function saveGitCode(){
               '　（不绑定的话 Issue / Star 不计分）', false);
       const a = accounts.find(x => x.id === gcAccountId);
       if(a){ a.gitcode_bind_state = 'unbound'; a.gitcode_bind_msg = bindMsg; renderBindState(a); }
+      // 用户名填错时，把输入框选中，用户直接改就行
+      if(needUsername){
+        $('gcUser').focus();
+        $('gcUser').select();
+      }
       $('gcPass').value = '';
       loadAccounts();
       showVnc('stuck');
