@@ -24,6 +24,7 @@ import (
 	"hwcloud/internal/fsutil"
 	"hwcloud/internal/huawei"
 	"hwcloud/internal/task"
+	"hwcloud/internal/textutil"
 )
 
 // Server 是管理面板的 HTTP 服务。
@@ -201,6 +202,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/accounts", guard(s.handleAccounts))
 	mux.HandleFunc("/api/accounts/add", guard(s.handleAddAccount))
 	mux.HandleFunc("/api/accounts/remove", guard(s.handleRemoveAccount))
+	mux.HandleFunc("/api/accounts/remark", guard(s.handleAccountRemark))
 	mux.HandleFunc("/api/accounts/check", guard(s.handleCheckAccount))
 	mux.HandleFunc("/api/accounts/login", guard(s.handleAccountLogin))
 	mux.HandleFunc("/api/accounts/captcha", guard(s.handleCaptcha))
@@ -422,6 +424,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{
 			"id":            a.ID,
 			"phone":         a.Phone,
+			"remark":        a.Remark,
 			"trusted":       a.Trusted,
 			"trusted_at":    a.TrustedAt,
 			"alive":         a.Alive,
@@ -626,7 +629,11 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	req.Phone = strings.TrimSpace(req.Phone)
+	// 清洗输入：从网页/微信/密码管理器复制时常带进不可见字符
+	// （NBSP、零宽空格、BOM、全角空格），在输入框里看不见，
+	// 但会让「密码正确」变成「账号或密码错误」。
+	req.Phone = textutil.CleanPhone(req.Phone)
+	req.Password = textutil.CleanPassword(req.Password)
 	if req.Phone == "" || req.Password == "" {
 		writeJSON(w, map[string]any{"error": "手机号和密码都不能为空"})
 		return
@@ -706,6 +713,72 @@ func (s *Server) handleRemoveAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// isPhoneLike 判断一个字符串看起来是不是手机号。
+//
+// 用途：GitCode 允许用手机号登录，用户很容易把手机号当成用户名填进来。
+// 绑定接口要的是用户名，传手机号会 404。
+// 这里提前拦下，给出明确指引，而不是让用户对着
+// 「gitcode user not found, username: 130xxxxxxxx」猜。
+func isPhoneLike(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 11 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	// 中国大陆手机号以 1 开头
+	return s[0] == '1'
+}
+
+// handleAccountRemark 保存账号备注。
+//
+// 为什么单独一个接口而不是塞进现有的编辑流程：
+// 备注是高频小操作（用户随时想改个标签），不该为了改一行字
+// 触发会话校验、目录操作这些重逻辑。
+//
+// 请求：{"id":"账号ID","remark":"主号 / 测试 / 项目A"}
+// 备注允许为空（等于清除）。
+func (s *Server) handleAccountRemark(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		ID     string `json:"id"`
+		Remark string `json:"remark"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.ID == "" {
+		writeJSON(w, map[string]any{"error": "缺少 id"})
+		return
+	}
+	if _, ok := s.store.Get(req.ID); !ok {
+		writeJSON(w, map[string]any{"error": "账号不存在"})
+		return
+	}
+
+	// 清洗 + 限长。备注是展示用的，太长会把卡片撑坏。
+	remark := textutil.CleanUsername(req.Remark)
+	const maxLen = 40
+	if rs := []rune(remark); len(rs) > maxLen {
+		remark = string(rs[:maxLen])
+	}
+
+	if err := s.store.Update(req.ID, func(a *account.Account) {
+		a.Remark = remark
+	}); err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "remark": remark})
 }
 
 // handleCheckAccount 检查单个账号。
@@ -1257,6 +1330,31 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 				return map[string]any{"error": err.Error()}
 			}
 			// 登录成功后把会话同步到账号 state 目录（LoginGitCodeAuto 存的是当前账号目录）
+			//
+			// 顺手抓一次真实用户名并写回账号。
+			//
+			// 为什么必须自动抓：GitCode 允许用手机号/邮箱登录，
+			// 用户填手机号也能登录成功，但绑定接口要的是用户名，
+			// 传手机号会 404「gitcode user not found」。
+			// 让用户自己去个人主页复制用户名是多余的成本 ——
+			// 账号设置页上明明写着。
+			//
+			// 抓取失败不影响登录结果，只记在返回里让前端提示。
+			if u, uerr := task.FetchGitCodeUsername(); uerr == nil && u != "" {
+				res["gitcode_username"] = u
+				if u != acc.GitCodeUser {
+					_ = s.store.Update(id, func(a *account.Account) {
+						a.GitCodeUser = u
+						// 用户名变了，旧绑定状态作废
+						a.GitCodeBindState = ""
+						a.GitCodeBindMsg = ""
+					})
+					res["username_updated"] = true
+					res["previous_username"] = acc.GitCodeUser
+				}
+			} else if uerr != nil {
+				res["username_error"] = uerr.Error()
+			}
 			return res
 
 		case "bindgitcode":
@@ -1273,8 +1371,40 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 			if acc.GitCodeUser == "" {
 				return map[string]any{"error": "未设置 GitCode 用户名，请先填写"}
 			}
-			res, err := task.HohBind(acc.GitCodeUser)
+			// 用户名是手机号时，先从 GitCode 会话里自动抓真实用户名。
+			// 用户填手机号能登录（GitCode 支持），但绑定要的是用户名。
+			// 这里直接帮他换掉，不用他手动改。
+			bindUser := acc.GitCodeUser
+			if isPhoneLike(bindUser) {
+				if u, uerr := task.FetchGitCodeUsername(); uerr == nil && u != "" {
+					bindUser = u
+					_ = s.store.Update(id, func(a *account.Account) {
+						a.GitCodeUser = u
+					})
+				} else {
+					return map[string]any{
+						"error": fmt.Sprintf(
+							"GitCode 用户名填的是手机号（%s），且自动获取用户名失败：%v。"+
+								"请到 GitCode 账号设置页复制用户名后重新填写。",
+							bindUser, uerr),
+						"need_username": true,
+					}
+				}
+			}
+			res, err := task.HohBind(bindUser)
 			if err != nil {
+				// 把后端的 404「gitcode user not found」翻译成用户能懂的话
+				if strings.Contains(err.Error(), "gitcode user not found") {
+					return map[string]any{
+						"error": fmt.Sprintf(
+							"GitCode 上找不到用户「%s」。请确认：\n"+
+								"1. 用户名拼写正确（不是手机号、不是邮箱）\n"+
+								"2. 该 GitCode 账号已存在\n"+
+								"用户名在个人主页地址里：gitcode.com/<用户名>",
+							acc.GitCodeUser),
+						"need_username": true,
+					}
+				}
 				return map[string]any{"error": "绑定失败: " + err.Error()}
 			}
 			// HohBind 内部已经复核过一次；这里再根据结果给出明确结论，
@@ -1292,6 +1422,16 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 					"raw":     res["response"],
 				}
 			}
+			// 绑定成功：把状态写回账号，前端不用再查一次。
+			// 早先只返回给前端，账号里的 gitcode_bind_state 还是旧值，
+			// 导致绑定成功后列表仍显示「未绑定」。
+			now := time.Now().Format("2006-01-02 15:04:05")
+			_ = s.store.Update(id, func(a *account.Account) {
+				a.GitCodeUser = bindUser
+				a.GitCodeBindState = "bound"
+				a.GitCodeBindMsg = ""
+				a.GitCodeBindAt = now
+			})
 			return res
 
 		case "event":
@@ -2848,6 +2988,10 @@ func (s *Server) handleGitCodeCreds(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	// 同样清洗：GitCode 用户名从别处复制时也会带不可见字符，
+	// 导致「登录成功」但「绑定失败」（用户名对不上）。
+	req.User = textutil.CleanUsername(req.User)
+	req.Password = textutil.CleanPassword(req.Password)
 	if req.ID == "" || req.User == "" || req.Password == "" {
 		writeJSON(w, map[string]any{"error": "缺少 id / 用户名 / 密码"})
 		return
