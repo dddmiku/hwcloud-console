@@ -105,7 +105,9 @@ COPY assets/browsers/ ./browsers/
 #   - 镜像升级不会冲掉用户已下载的版本（在挂载卷里）
 #   - 首次启动不用联网下载，复制一份即可（秒级）
 #
-# pip 用清华源；浏览器下载走 CAMOUFOX_INSTALL 的环境变量控制。
+# pip 用清华源（国内构建快）。
+# 浏览器下载走 camoufox 自带的 GitHub Releases 拉取逻辑，
+# 安装位置由 XDG_CACHE_HOME 控制（见下面那段）。
 RUN python3 -m venv /opt/hwcloud-demo/venv \
     && /opt/hwcloud-demo/venv/bin/pip install --no-cache-dir --upgrade pip \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
