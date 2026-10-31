@@ -419,7 +419,7 @@ func clickIssueSubmit(page playwright.Page) error {
 // 填手机号也能登录成功。但华为云的绑定接口要的是**用户名**
 // （gitcode.com/<用户名> 里那段），传手机号会 404：
 //
-//	{"error":"gitcode user not found","username":"13005999962"}
+//	{"error":"gitcode user not found","username":"13800138000"}
 //
 // 用户名在好几个地方都有，最稳的是账号设置页：
 //
