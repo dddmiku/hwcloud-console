@@ -1,0 +1,17 @@
+[Unit]
+Description=x11vnc for hwcloud manual captcha solving
+After=hwcloud-xvfb.service
+Wants=hwcloud-xvfb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -rfbauth /etc/x11vnc.pass -forever -shared -rfbport 5901 -noxdamage
+Restart=always
+RestartSec=3
+# VNC 只监听 127.0.0.1，外部必须经 SSH 隧道进来，
+# 不要改成 0.0.0.0 —— 那等于把服务器桌面暴露到公网
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

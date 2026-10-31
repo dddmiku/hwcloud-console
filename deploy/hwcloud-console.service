@@ -1,0 +1,25 @@
+[Unit]
+Description=hwcloud web console
+After=network-online.target hwcloud-xvfb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HWCLOUD_HOME=/opt/hwcloud-demo
+Environment=PLAYWRIGHT_DRIVER_PATH=/opt/hwcloud-demo/playwright-driver
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/hwcloud-demo/browsers
+# DISPLAY 必须设置：面板里的 Star / 活动报名 / 提 Issue 都要有头浏览器。
+# GitCode 对无头浏览器做了行为判定，headless=True 时访问 /issues/create
+# 会被 302 回列表，表现成「会话失效」，极难排查。
+# 缺这个变量时这些任务在 systemd 下会直接报 Missing X server or $DISPLAY。
+Environment=DISPLAY=:99
+ExecStart=/opt/hwcloud-demo/go/bin/hwcloud serve --addr :8899
+Restart=always
+RestartSec=10
+User=root
+# 优雅关闭：Go 侧已处理 SIGTERM 并等待在跑任务收尾，给足时间
+TimeoutStopSec=40
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

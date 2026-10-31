@@ -1,0 +1,23 @@
+[Unit]
+Description=hwcloud session keepalive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hwcloud-keepalive.sh
+User=root
+# 必须有启动超时：Type=oneshot 没有超时的话，一次卡死的浏览器
+# 会让这个 unit 永远处于 activating 状态，systemd 认为它还在跑，
+# 后续 timer 触发全部被跳过 —— 续期从此静默停摆，账号慢慢全部掉线，
+# 而日志里什么异常都没有。
+#
+# 单个账号的 keepalive 最长约 90 秒（Camoufox 登录 30-90 秒），
+# 加上多账号循环，5 分钟足够覆盖正常情况。
+TimeoutStartSec=300
+# 超时后连子进程一起杀（浏览器是独立进程树，不杀会残留）
+KillMode=control-group
+Environment=DISPLAY=:99
+
+[Install]
+WantedBy=multi-user.target

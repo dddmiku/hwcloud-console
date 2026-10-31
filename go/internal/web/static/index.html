@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hwcloud 控制台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<!-- 认证界面 -->
+<div class="auth-screen" id="authScreen">
+  <div class="auth-box">
+    <h1 id="authTitle">hwcloud 控制台</h1>
+    <p class="sub" id="authSub">请输入访问密码</p>
+    <div id="setupBlock" style="display:none">
+      <label>用户名</label>
+      <input id="setupUser" placeholder="至少 3 位" autocomplete="username">
+      <label>密码</label>
+      <input id="setupPw" type="password" placeholder="至少 6 位" autocomplete="new-password">
+      <label>确认密码</label>
+      <input id="setupPw2" type="password" placeholder="再次输入" autocomplete="new-password">
+    </div>
+    <div id="loginBlock">
+      <label>用户名</label>
+      <input id="authUser" placeholder="用户名" autocomplete="username">
+      <label>密码</label>
+      <input id="authPw" type="password" placeholder="密码" autocomplete="current-password">
+    </div>
+    <div class="btns" style="margin-top:18px">
+      <button class="btn primary" id="authBtn" data-call="doAuth" style="width:100%">进入</button>
+    </div>
+    <div class="msg" id="authMsg"></div>
+  </div>
+</div>
+
+<div class="wrap" id="mainWrap" style="display:none">
+  <header>
+    <h1>hwcloud 控制台</h1>
+    <span class="sub" id="clock"></span>
+    <span class="sub" id="userInfo"></span>
+    <span class="spacer"></span>
+    <button class="btn sm" data-call="loadAccounts">刷新</button>
+    <button class="btn sm primary" data-call="openAdd">+ 添加账号</button>
+    <button class="btn sm" data-call="doLogout">退出</button>
+  </header>
+
+  <div class="card">
+    <h2>账号 <span class="badge" id="accCount">0</span></h2>
+    <div id="accList"><div class="empty">加载中…</div></div>
+    <div class="msg" id="globalMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>定时任务</h2>
+    <div id="timerBox"><div class="hint">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>日志</h2>
+    <div class="tabs">
+      <button class="tab active" data-log="service.log" data-call="loadLogTab">service</button>
+      <button class="tab" data-log="keepalive.log" data-call="loadLogTab">keepalive</button>
+      <button class="tab" data-log="daily.log" data-call="loadLogTab">daily</button>
+      <button class="tab" data-log="weekly.log" data-call="loadLogTab">weekly</button>
+    </div>
+    <pre id="logBox">加载中…</pre>
+    <div class="btns">
+      <button class="btn sm" data-call="loadLogRefresh">刷新</button>
+    </div>
+  </div>
+</div>
+
+<!-- GitCode 凭据 -->
+<div class="modal" id="gitcodeModal">
+  <div class="modal-box">
+    <h3>GitCode 账号</h3>
+    <div class="sub">存一份账密，会话失效时自动重登，提 Issue 就不会断</div>
+
+    <!-- 绑定状态横幅：必须显眼，没绑定时提 Issue 不计分 -->
+    <div class="bind-state" id="gcBindState" hidden>
+      <span class="bind-icon" id="gcBindIcon">•</span>
+      <span class="bind-text" id="gcBindText"></span>
+      <button class="btn sm" data-call="probeBindState">重新查询</button>
+    </div>
+
+    <label>用户名</label>
+    <input id="gcUser" placeholder="GitCode 用户名" autocomplete="username">
+    <label>密码</label>
+    <input id="gcPass" type="password" placeholder="GitCode 密码" autocomplete="current-password">
+    <div class="btns">
+      <button class="btn primary" data-call="saveGitCode">保存并登录</button>
+      <button class="btn sm" data-call="closeGitCode">关闭</button>
+    </div>
+    <div class="msg" id="gcMsg"></div>
+
+    <!-- VNC 面板：点「保存并登录」立刻展开，不等超时。
+         浏览器跑在服务器的 Xvfb 上，用户本地看不到画面，
+         要过滑块/验证码必须连进来看。提前摊开，用户不用干等 3 分钟。 -->
+    <div class="vnc-box" id="gcVnc" hidden>
+      <div class="vnc-head">
+        <strong id="vncTitle">登录进行中，可以在这里看画面</strong>
+        <button class="btn sm" data-call="hideVnc">收起</button>
+      </div>
+      <div class="vnc-body">
+        <p class="vnc-tip" id="vncTip">服务器正在打开浏览器。如果卡在滑块验证码，用下面任一方式连进来手动操作。</p>
+
+        <!-- 网页版：点一下就能看，不用装客户端 -->
+        <div class="vnc-row" id="vncWebRow" hidden>
+          <span class="vnc-k">推荐</span>
+          <a class="btn sm primary" id="vncWebBtn" href="/vnc/" target="_blank" rel="noopener">
+            在浏览器中打开画面
+          </a>
+          <span class="vnc-inline-hint">不用装客户端</span>
+        </div>
+
+        <div class="vnc-sep" id="vncSep" hidden><span>或者用 VNC 客户端</span></div>
+
+        <div class="vnc-row">
+          <span class="vnc-k">1. SSH 隧道</span>
+          <code class="vnc-cmd" id="vncTunnel">—</code>
+          <button class="btn sm" data-call="copyVncTunnel">复制</button>
+        </div>
+        <div class="vnc-row">
+          <span class="vnc-k">2. 连接地址</span>
+          <code class="vnc-cmd" id="vncAddr">—</code>
+        </div>
+        <div class="vnc-row">
+          <span class="vnc-k">3. 密码</span>
+          <code class="vnc-cmd" id="vncPass">—</code>
+          <button class="btn sm" data-call="copyVncPass">复制</button>
+        </div>
+        <div class="vnc-hint" id="vncHint"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 成长中心任务列表 -->
+<div class="modal" id="tasksModal">
+  <div class="modal-box" style="max-width:640px">
+    <h3 id="tasksTitle">成长中心任务</h3>
+    <div class="sub">1-5 星全部任务；未完成的按星级从低到高做更划算</div>
+    <div id="tasksBody" class="tasks-list"></div>
+    <div class="btns">
+      <button class="btn sm" data-call="closeTasks">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 添加账号弹窗 -->
+<div class="modal" id="addModal">
+  <div class="modal-box">
+    <h3>添加账号</h3>
+    <div class="sub">添加时会直接走一遍登录流程，成功即完成设备信任</div>
+    <label>手机号</label>
+    <input id="newPhone" placeholder="请输入手机号" autocomplete="username">
+    <label>密码</label>
+    <input id="newPassword" type="password" placeholder="密码" autocomplete="current-password">
+    <div class="btns">
+      <button class="btn primary" data-call="doAdd">添加</button>
+      <button class="btn" data-call="closeAdd">取消</button>
+    </div>
+    <div class="msg" id="addMsg"></div>
+  </div>
+</div>
+
+<!-- 登录弹窗 -->
+<div class="modal" id="loginModal">
+  <div class="modal-box">
+    <h3 id="loginTitle">登录</h3>
+    <div class="sub" id="loginSub"></div>
+
+    <label>手机号</label>
+    <input id="loginPhone" autocomplete="username">
+    <label>密码</label>
+    <input id="loginPassword" type="password" autocomplete="current-password">
+
+    <!-- 浏览器登录进度：Camoufox 在服务器上跑真实 Firefox 生成设备指纹，
+         实测能跳过滑块，只需要一次短信验证码 -->
+    <div id="cscBlock" style="display:none">
+      <label>浏览器登录</label>
+      <div class="csc-box" id="cscBox">
+        <div class="csc-hint" id="cscHint">正在启动浏览器…</div>
+      </div>
+    </div>
+
+    <div id="smsBlock" style="display:none">
+      <label>短信验证码</label>
+      <input id="loginCode" placeholder="6 位数字" maxlength="6" inputmode="numeric">
+    </div>
+
+    <div class="btns">
+      <button class="btn primary" id="btnLogin" data-call="doLogin">登录</button>
+      <button class="btn primary" id="btnTrust" data-call="doTrust" style="display:none">提交验证码</button>
+    </div>
+    <div class="btns">
+      <button class="btn sm" data-call="closeLogin">关闭</button>
+    </div>
+    <div class="msg" id="loginMsg"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

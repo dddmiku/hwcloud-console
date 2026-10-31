@@ -1,0 +1,23 @@
+[Unit]
+Description=hwcloud independent service (session keepalive + task runner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HWCLOUD_HOME=/opt/hwcloud-demo
+Environment=HWCLOUD_INTERVAL=600
+Environment=PLAYWRIGHT_DRIVER_PATH=/opt/hwcloud-demo/playwright-driver
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/hwcloud-demo/browsers
+# 常驻守护进程也会拉起有头浏览器（会话续期 / 任务），缺 DISPLAY 会直接失败
+Environment=DISPLAY=:99
+ExecStart=/opt/hwcloud-demo/deploy/hwcloud-service.sh daemon
+Restart=always
+RestartSec=30
+User=root
+# 给守护进程留出处理 SIGTERM 的时间（它内部有 sleep 循环）
+TimeoutStopSec=40
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

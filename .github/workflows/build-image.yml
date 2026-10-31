@@ -1,0 +1,133 @@
+name: Build and push Docker image
+
+# 为什么用 Actions 构建而不是在目标服务器上构建：
+#   目标服务器（1.7GB 内存的小机器）到 Docker Hub 全线超时，
+#   registry-1.docker.io / 各镜像源都拉不到基础镜像。
+#   Actions 的 runner 网络通畅，构建完直接推到 ghcr，
+#   用户只需要 docker compose pull。
+#
+# 镜像里**自带 Camoufox**（华为云自动登录用的定制 Firefox，约 2.4GB）。
+# 早先版本让用户自己装，但国内网络从 GitHub 下载失败率太高。
+#
+# 触发：
+#   - push 到 main 且改动涉及源码/部署文件
+#   - 手动触发（workflow_dispatch）
+#   - 每周一自动重建（拿基础镜像和 Camoufox 的安全更新）
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'go/**'
+      - 'deploy/**'
+      - 'data/**'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/hwcloud-console
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go/go.sum
+
+      - name: Build Linux binary
+        run: |
+          cd go
+          # CGO_ENABLED=0：纯静态二进制，不依赖目标机 glibc 版本。
+          # -trimpath + -s -w：去掉绝对路径和符号表，12MB 左右。
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o ../deploy/assets/hwcloud ./cmd/hwcloud
+          ls -lh ../deploy/assets/hwcloud
+
+      - name: Install Playwright driver
+        run: |
+          # Dockerfile 期望 deploy/assets/ 下有两样东西：
+          #   playwright-driver/        —— node 驱动 + node 运行时
+          #   browsers/chromium-<rev>/  —— 对应版本的 Chromium
+          #
+          # 版本必须精确对齐 go.mod 里的 playwright-go v0.6100.0：
+          #   driver 1.61.1 / chromium-1228
+          # 装错版本浏览器起不来，报错是 "Executable doesn't exist"。
+          cd deploy/assets
+          mkdir -p playwright-driver
+
+          # 1) node 运行时。playwright-go 启动 driver 时要执行 node。
+          cp "$(which node)" playwright-driver/node
+          chmod +x playwright-driver/node
+
+          # 2) playwright npm 包（driver 本体）
+          npm i playwright@1.61.1 --no-save
+          cp -r node_modules/playwright playwright-driver/package
+          mkdir -p playwright-driver/package/node_modules
+          cp -r node_modules/playwright-core playwright-driver/package/node_modules/
+
+          # 3) Chromium，路径必须落在 browsers/chromium-<rev>/
+          PLAYWRIGHT_BROWSERS_PATH="$PWD/browsers" npx playwright install chromium
+
+          V=$(node -p "require('./playwright-driver/package/package.json').version")
+          echo "driver version: $V"
+          [ "$V" = "1.61.1" ] || { echo "版本不匹配，期望 1.61.1"; exit 1; }
+          ls browsers/
+          du -sh playwright-driver browsers
+
+      - name: Prepare task data
+        run: |
+          mkdir -p deploy/assets/data
+          cp -r data/* deploy/assets/data/ 2>/dev/null || true
+          ls -la deploy/assets/data
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # 为什么不用 secrets.GITHUB_TOKEN：
+          #   这个包是 public，仓库默认 token 推不上去，报
+          #   "denied: permission_denied: write_package"。
+          #   public 包的写入必须用显式带 write:packages 的 PAT。
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,format=short
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./deploy
+          file: ./deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 镜像含 Camoufox（2.4GB）+ Chromium（379MB），
+          # 层数多、体积大，默认超时可能不够。
+          provenance: false

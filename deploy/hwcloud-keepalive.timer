@@ -1,0 +1,11 @@
+[Unit]
+Description=hwcloud session keepalive (refresh ECO_CN_ID via SSO)
+
+[Timer]
+# ECO_CN_ID 只有 1 小时寿命，每 20 分钟刷一次留足余量
+OnCalendar=*:0/20
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

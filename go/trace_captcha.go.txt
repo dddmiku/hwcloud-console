@@ -1,0 +1,151 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
+
+func main() {
+	pw, err := playwright.Run()
+	if err != nil {
+		fmt.Println("playwright run:", err)
+		return
+	}
+	defer pw.Stop()
+
+	headless := false
+	if len(os.Args) > 1 && os.Args[1] == "--headless" {
+		headless = true
+	}
+
+	br, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(headless),
+		Args: []string{
+			"--disable-blink-features=AutomationControlled",
+			"--no-first-run",
+		},
+	})
+	if err != nil {
+		fmt.Println("launch:", err)
+		return
+	}
+	defer br.Close()
+
+	ctx, err := br.NewContext(playwright.BrowserNewContextOptions{
+		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"),
+		Locale:    playwright.String("zh-CN"),
+		Viewport:  &playwright.Size{Width: 1440, Height: 900},
+	})
+	if err != nil {
+		fmt.Println("ctx:", err)
+		return
+	}
+	defer ctx.Close()
+
+	page, err := ctx.NewPage()
+	if err != nil {
+		fmt.Println("page:", err)
+		return
+	}
+
+	// 抓所有 ajaxHandler 请求
+	var captured []map[string]any
+	page.On("request", func(req playwright.Request) {
+		u := req.URL()
+		if !strings.Contains(u, "ajaxHandler") {
+			return
+		}
+		body := ""
+		if pd, ok := req.PostData(); ok {
+			body = pd
+		}
+		rec := map[string]any{
+			"url":  u,
+			"body": body,
+			"t":    time.Now().Format("15:04:05"),
+		}
+		captured = append(captured, rec)
+		name := u
+		if i := strings.Index(name, "ajaxHandler/"); i > 0 {
+			name = name[i+len("ajaxHandler/"):]
+		}
+		if i := strings.Index(name, "?"); i > 0 {
+			name = name[:i]
+		}
+		fmt.Printf("[REQ %s] %s\n", rec["t"], name)
+		if body != "" && len(body) < 600 {
+			fmt.Println("   body:", body)
+		}
+	})
+
+	page.On("response", func(resp playwright.Response) {
+		u := resp.URL()
+		if !strings.Contains(u, "ajaxHandler") {
+			return
+		}
+		name := u
+		if i := strings.Index(name, "ajaxHandler/"); i > 0 {
+			name = name[i+len("ajaxHandler/"):]
+		}
+		if i := strings.Index(name, "?"); i > 0 {
+			name = name[:i]
+		}
+		if strings.Contains(name, "authCode") || strings.Contains(name, "captcha") {
+			go func() {
+				if txt, err := resp.Text(); err == nil {
+					if len(txt) > 500 {
+						txt = txt[:500] + "..."
+					}
+					fmt.Printf("[RESP] %s => %s\n", name, txt)
+				}
+			}()
+		}
+	})
+
+	target := "https://auth.huaweicloud.com/authui/login.html?service=https%3A%2F%2Fwww.huaweicloud.com%2F&locale=zh-cn"
+	fmt.Println("打开:", target)
+	if _, err := page.Goto(target, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(60000),
+	}); err != nil {
+		fmt.Println("goto:", err)
+	}
+
+	time.Sleep(4 * time.Second)
+
+	// 切换到账密登录
+	page.Evaluate(`() => {
+		const els = [...document.querySelectorAll('*')];
+		const t = els.find(e => e.children.length === 0 && /账号密码登录|密码登录|帐号密码/.test(e.textContent||''));
+		if (t) t.click();
+	}`)
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("\n请在浏览器里手动输入账号密码并提交（如果出现图片验证码也请手动完成）。")
+	fmt.Println("60 秒后自动退出，或按 Ctrl+C 提前结束。")
+
+	// 等到出现 authCode 相关请求或超时
+	deadline := time.Now().Add(180 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(1 * time.Second)
+		// 检测是否出现过 authCodeValidate
+		for _, c := range captured {
+			if strings.Contains(c["url"].(string), "authCodeValidate") {
+				fmt.Println("\n=== 已捕获 authCodeValidate，再等 5 秒收集后续 ===")
+				time.Sleep(5 * time.Second)
+				goto dump
+			}
+		}
+	}
+
+dump:
+	fmt.Println("\n=== 全部 ajaxHandler 请求 ===")
+	out, _ := json.MarshalIndent(captured, "", "  ")
+	os.WriteFile("D:/hwcloud-demo/tmp/trace.json", out, 0o644)
+	fmt.Println("已保存 D:/hwcloud-demo/tmp/trace.json，共", len(captured), "条")
+}

@@ -1,0 +1,127 @@
+package main
+
+// 用 Playwright 打开我们自己的面板，走一遍滑块登录，验证 csc 链路是否打通。
+// 用法: csc_test.exe <panelURL> <username> <password> <accountID>
+//
+// 滑块本身需要人工拖，所以这里用 --headed 打开可见窗口。
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
+
+func main() {
+	if len(os.Args) < 5 {
+		fmt.Println("用法: csc_test.exe <panelURL> <username> <password> <accountID>")
+		return
+	}
+	panelURL, user, pass, accountID := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+
+	pw, err := playwright.Run()
+	if err != nil {
+		fmt.Println("playwright:", err)
+		return
+	}
+	defer pw.Stop()
+
+	br, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(false),
+		Args: []string{
+			"--disable-blink-features=AutomationControlled",
+			"--no-first-run",
+		},
+	})
+	if err != nil {
+		fmt.Println("launch:", err)
+		return
+	}
+	defer br.Close()
+
+	ctx, err := br.NewContext(playwright.BrowserNewContextOptions{
+		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"),
+		Locale:    playwright.String("zh-CN"),
+		Viewport:  &playwright.Size{Width: 1200, Height: 900},
+	})
+	if err != nil {
+		fmt.Println("ctx:", err)
+		return
+	}
+	defer ctx.Close()
+
+	page, err := ctx.NewPage()
+	if err != nil {
+		fmt.Println("page:", err)
+		return
+	}
+
+	// 打印所有 console 与网络失败，方便排错
+	page.On("console", func(m playwright.ConsoleMessage) {
+		fmt.Printf("[console.%s] %s\n", m.Type(), m.Text())
+	})
+	page.On("pageerror", func(e error) {
+		fmt.Printf("[pageerror] %v\n", e)
+	})
+
+	fmt.Println("打开面板:", panelURL)
+	if _, err := page.Goto(panelURL, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(30000),
+	}); err != nil {
+		fmt.Println("goto:", err)
+		return
+	}
+
+	time.Sleep(2 * time.Second)
+
+	// 登录面板
+	page.Fill("#authUser", user)
+	page.Fill("#authPw", pass)
+	page.Click("#authBtn")
+	time.Sleep(3 * time.Second)
+
+	// 等账号列表出现
+	page.WaitForSelector(".acc", playwright.PageWaitForSelectorOptions{Timeout: playwright.Float(15000)})
+
+	// 点该账号的「登录」按钮
+	js := fmt.Sprintf(`() => {
+		const cards = [...document.querySelectorAll('.acc')];
+		for (const c of cards) {
+			const b = [...c.querySelectorAll('button')].find(x => x.textContent.trim() === '登录');
+			if (b) { b.click(); return true; }
+		}
+		return false;
+	}`)
+	v, err := page.Evaluate(js)
+	fmt.Println("点击登录按钮:", v, err)
+	time.Sleep(2 * time.Second)
+
+	// 填密码
+	page.Fill("#loginPassword", pass)
+	// 点登录（会触发纯账密 → 被风控拦 → 自动转滑块）
+	page.Click("#btnLogin")
+
+	fmt.Println("\n=== 等待滑块出现，请在浏览器里手动拖动滑块 ===")
+	fmt.Println("最多等 180 秒")
+
+	deadline := time.Now().Add(180 * time.Second)
+	for time.Now().Before(deadline) {
+		if page.IsClosed() {
+			fmt.Println("页面被关闭")
+			return
+		}
+		// 检查是否已经登录成功
+		msg, _ := page.TextContent("#loginMsg")
+		if msg != "" {
+			fmt.Println("[loginMsg]", msg)
+		}
+		// 检查滑块容器是否有内容
+		cscHTML, _ := page.InnerHTML("#cscBox")
+		if len(cscHTML) > 100 {
+			fmt.Println("[滑块已渲染]")
+		}
+		time.Sleep(3 * time.Second)
+	}
+}

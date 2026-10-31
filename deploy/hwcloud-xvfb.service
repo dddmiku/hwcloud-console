@@ -1,0 +1,16 @@
+[Unit]
+Description=Xvfb virtual display for hwcloud
+Documentation=file:/opt/hwcloud-demo/deploy/hwcloud-console.service
+After=network.target
+
+[Service]
+Type=simple
+# :99 是约定俗成的编号，hwcloud-console.service 里 DISPLAY=:99 与此对应。
+# 改这里必须同步改那个文件的 DISPLAY，否则浏览器起不来，
+# 报错是 "Missing X server or $DISPLAY"。
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1440x1000x24 -nolisten tcp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
