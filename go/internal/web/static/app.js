@@ -97,11 +97,30 @@ function showAuthScreen(reason){
   if(u) u.focus();
 }
 
+// 自动隐藏定时器按元素分开记 —— 页面上有 globalMsg / loginMsg / addMsg
+// 等多个消息框，共用一个 timer 会让它们互相取消。
+const msgHideTimers = new Map();
+
 function showMsg(el, text, ok){
   const box = $(el);
-  box.textContent = text;
-  box.className = 'msg show ' + (ok ? 'ok' : 'err');
-  if(ok) setTimeout(() => box.classList.remove('show'), 6000);
+  if(!box) return;
+
+  const cls = 'msg show ' + (ok ? 'ok' : 'err');
+  // 内容没变就什么都不做 —— 这是消除闪烁的关键
+  if(box.textContent === text && box.className === cls) return;
+
+  if(box.textContent !== text) box.textContent = text;
+  if(box.className !== cls) box.className = cls;
+
+  // 只保留该元素的一个隐藏定时器，避免多个定时器互相打架
+  const old = msgHideTimers.get(el);
+  if(old){ clearTimeout(old); msgHideTimers.delete(el); }
+  if(ok){
+    msgHideTimers.set(el, setTimeout(() => {
+      box.classList.remove('show');
+      msgHideTimers.delete(el);
+    }, 6000));
+  }
 }
 
 // ===== 认证 =====
@@ -1151,7 +1170,13 @@ function pollJob(jobId, label){
       const elapsed = Math.round((Date.now() - started) / 1000);
 
       if(j.running){
-        showMsg('globalMsg', label + ' 执行中…（' + j.step + '，已 ' + elapsed + ' 秒）', true);
+        // 进度文字只在「整十秒」时才变。
+        //
+        // 原来每 3 秒刷一次「已 N 秒」，数字一直在跳，看起来像闪烁。
+        // 实际上后台任务的进度本来就是分钟级的，秒数没必要实时 ——
+        // 取整到 10 秒既够看又不闹眼睛。
+        const shown = Math.floor(elapsed / 10) * 10;
+        showMsg('globalMsg', label + ' 执行中…（' + j.step + '，已 ' + shown + ' 秒）', true);
         return;
       }
 
