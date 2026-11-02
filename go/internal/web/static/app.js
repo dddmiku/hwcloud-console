@@ -497,6 +497,7 @@ function renderAccount(a){
       gitcodeBtn(a) +
       act('run', 'keepalive', '保活') +
       act('relogin', '', '重新登录') +
+      act('beans', '', '积分') +
       act('check', '', '检查') +
       act('tasks', '', '任务') +
       '<span class="spacer"></span>' +
@@ -572,6 +573,7 @@ function bindAccountActions(){
       // 重新登录：用服务器上存的账号密码重走一遍完整登录流程
       // （滑块自动过、短信验证码照常填），不需要用户再输密码。
       case 'relogin':  startRelogin(id); break;
+      case 'beans':    queryBeans(id); break;
       case 'check':    checkAccount(id); break;
       case 'tasks':    showTasks(id); break;
       case 'remove':   removeAccount(id); break;
@@ -633,6 +635,33 @@ async function startRelogin(id){
   showMsg('loginMsg', '正在用已保存的密码登录…', true);
   // 直接开跑，用户不用再点一次「登录」
   setTimeout(() => doLogin(), 200);
+}
+
+// queryBeans 查一次实时积分。
+//
+// 为什么不复用列表里的 beans 字段：那个有 60 秒缓存，而且离线时是 -1。
+// 用户点这个按钮就是想要「现在的准确值」，所以走单独的 /run?name=beans。
+//
+// 后端用 withAccountTry，长任务占着锁时会立刻返回 busy ——
+// 这里如实提示「稍后再查」，不假装成功也不让用户干等。
+async function queryBeans(id){
+  const a = accounts.find(x => x.id === id);
+  const label = a ? a.phone : id;
+  showMsg('globalMsg', label + ' 正在查询积分…', true, {sticky:true});
+  try{
+    const r = await api('/api/accounts/run?id=' + encodeURIComponent(id) + '&name=beans', {
+      method:'POST'
+    });
+    if(r.error){
+      showMsg('globalMsg', label + ' 积分查询失败: ' + r.error, false);
+      return;
+    }
+    showMsg('globalMsg', label + ' 当前积分：' + r.beans, true);
+    // 重新拉列表 —— 后端已经把新积分写进 beansCache，这次刷新会显示新值
+    loadAccounts();
+  }catch(e){
+    showMsg('globalMsg', label + ' 积分查询失败: ' + e.message, false);
+  }
 }
 
 async function removeAccount(id){

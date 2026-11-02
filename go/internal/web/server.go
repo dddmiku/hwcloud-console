@@ -980,6 +980,8 @@ func taskLabel(name string) string {
 		return "检查"
 	case "tasks":
 		return "任务"
+	case "beans":
+		return "积分"
 	case "daily":
 		return "一键日常"
 	case "weekly":
@@ -1312,6 +1314,42 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 			"username":  res.Username,
 			"message":   res.Message,
 		})
+		return
+	}
+
+	// 积分查询：纯 HTTP，同样不该排长任务的队。
+	//
+	// 和 tasks 一样走 withAccountTry —— 拿不到锁就报忙，不阻塞。
+	// 用 BeansE 而不是 Beans：后者失败时返回 0，用户会以为积分清零了。
+	if name == "beans" {
+		var out map[string]any
+		if !s.withAccountTry(id, func() any {
+			sess, err := huawei.New("")
+			if err != nil {
+				out = map[string]any{"error": err.Error()}
+				return nil
+			}
+			n, err := sess.BeansE()
+			if err != nil {
+				out = map[string]any{"error": err.Error()}
+				return nil
+			}
+			out = map[string]any{"beans": n, "username": sess.Username}
+			return nil
+		}) {
+			writeJSON(w, map[string]any{
+				"error": "有任务正在执行，账号上下文被占用，请稍后再查积分",
+				"busy":  true,
+			})
+			return
+		}
+		// 顺手更新缓存，面板卡片下次刷新就能看到新积分
+		if n, ok := out["beans"].(int); ok {
+			s.beansMu.Lock()
+			s.beansCache[id] = beanEntry{val: n, at: time.Now()}
+			s.beansMu.Unlock()
+		}
+		writeJSON(w, out)
 		return
 	}
 

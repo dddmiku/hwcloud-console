@@ -366,15 +366,31 @@ func (s *Session) AllMissions() ([]Mission, error) {
 }
 
 func (s *Session) Beans() int {
+	n, _ := s.BeansE()
+	return n
+}
+
+// BeansE 同 Beans，但区分「真的是 0 分」和「请求失败」。
+//
+// 面板的「积分」按钮要用这个：Beans() 失败时返回 0，用户会以为
+// 积分清零了，而实际上只是网络抖了一下或会话过期。
+func (s *Session) BeansE() (int, error) {
 	data, status, err := s.do(http.MethodGet, "beans", nil)
-	if err != nil || status != http.StatusOK {
-		return 0
+	if err != nil {
+		return 0, err
+	}
+	if status != http.StatusOK {
+		return 0, fmt.Errorf("积分接口返回 HTTP %d", status)
 	}
 	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
-		return 0
+		return 0, fmt.Errorf("积分响应解析失败: %w", err)
 	}
-	return int(asFloat(result["beans"]))
+	v, ok := result["beans"]
+	if !ok {
+		return 0, fmt.Errorf("积分响应里没有 beans 字段: %s", truncate(data))
+	}
+	return int(asFloat(v)), nil
 }
 
 func asFloat(v any) float64 {
