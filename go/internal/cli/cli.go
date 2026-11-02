@@ -215,7 +215,16 @@ func cliAutoLogin() (bool, string) {
 	if err := task.SaveCamoufoxArtifacts(res); err != nil {
 		return false, "保存会话失败: " + err.Error()
 	}
-	store.MarkChecked(id, true, acc.Phone, 0, "")
+	// 用户名必须从会话里读，不能写手机号。
+	// 早先这里写 acc.Phone，导致 account.json 的 username 变成手机号，
+	// 和面板/check 从 cookie 读到的 yd_xxxxxxxxx 对不上，看起来像串号。
+	uname := ""
+	if info, err := task.SessionInfo(); err == nil {
+		if v, ok := info["username"].(string); ok {
+			uname = v
+		}
+	}
+	store.MarkChecked(id, true, uname, 0, "")
 	if res.Trusted {
 		_ = store.Update(id, func(a *account.Account) {
 			a.Trusted = true

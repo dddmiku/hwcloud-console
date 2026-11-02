@@ -551,8 +551,33 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 	var remain float64
 	beans := -1
 
+	// 积分缓存：命中就不用再去远程查。
+	//
+	// 注意必须在拿账号锁**之前**读缓存，且只在同一把锁内使用缓存值 ——
+	// 见下面「为什么必须合并成一次 withAccountTry」的说明。
+	beansCached, beansHit := 0, false
+	s.beansMu.Lock()
+	if e, ok := s.beansCache[id]; ok && time.Since(e.at) < 60*time.Second {
+		beansCached, beansHit = e.val, true
+	}
+	s.beansMu.Unlock()
+
 	// 用 TryLock：长任务（保活 / 周常 / 云实验）持锁期间拿不到锁，
 	// 直接退回上次缓存，而不是把请求排到队列里干等。
+	//
+	// 【必须一次拿锁做完会话检查 + 取积分】
+	//
+	// 这里原来写的是两次独立的 withAccountTry：
+	//   第一次：SessionInfo()（读 cookies.json 判会话）
+	//   第二次：huawei.New("").Beans()（读同一份 cookies 取积分）
+	// 两次之间锁会释放，而 config.SetAccount 是**进程级全局变量**。
+	// 只要中间有别的 goroutine 拿了锁并把 accountID 改成 B，
+	// 第二次就会读 B 的 cookies，把 B 的积分记到 A 头上。
+	//
+	// 实测症状：面板上多个账号显示同一个用户名、同一份积分。
+	//
+	// 会话检查和积分都依赖 config.CookieFile()（= 全局 accountID），
+	// 所以它们必须在**同一次**持锁期间完成，不能拆开。
 	ok := s.withAccountTry(id, func() any {
 		info, err := task.SessionInfo()
 		if err != nil {
@@ -567,6 +592,16 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 		if v, ok := info["auth_remaining_days"].(float64); ok {
 			remain = v
 		}
+		if !alive {
+			return nil
+		}
+		if beansHit {
+			beans = beansCached
+			return nil
+		}
+		if sess, err := huawei.New(""); err == nil {
+			beans = sess.Beans()
+		}
 		return nil
 	})
 	if !ok {
@@ -577,32 +612,7 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 		return false, "", 0, -1
 	}
 
-	if !alive {
-		return alive, username, remain, beans
-	}
-
-	// 缓存命中就直接用
-	s.beansMu.Lock()
-	if e, ok := s.beansCache[id]; ok && time.Since(e.at) < 60*time.Second {
-		beans = e.val
-		s.beansMu.Unlock()
-		return alive, username, remain, beans
-	}
-	s.beansMu.Unlock()
-
-	// 积分同样用 TryLock —— 它在会话检查之后，期间锁可能已被别的任务抢走
-	if !s.withAccountTry(id, func() any {
-		if sess, err := huawei.New(""); err == nil {
-			beans = sess.Beans()
-		}
-		return nil
-	}) {
-		if snap, hit := s.cachedProbe(id); hit {
-			return alive, username, remain, snap.Beans
-		}
-		return alive, username, remain, -1
-	}
-	if beans >= 0 {
+	if beans >= 0 && !beansHit {
 		s.beansMu.Lock()
 		s.beansCache[id] = beanEntry{val: beans, at: time.Now()}
 		s.beansMu.Unlock()
@@ -1239,12 +1249,41 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	// 那边其实已经登录成功了（实测卡死 2 分钟以上，会话产物是新的
 	// 但 cookies.json 一直没更新）。
 	if name == "keepalive" {
-		// 先看会话还在不在；在就直接返回，不必开浏览器
-		res, err := task.KeepAlive(true, 0)
-		if err != nil {
-			res = &task.KeepAliveResult{After: "expired", Message: err.Error()}
+		// 先看会话还在不在；在就直接返回，不必开浏览器。
+		//
+		// 【这次会话检查必须在账号上下文里做】
+		//
+		// KeepAlive → huaweiSession() → huawei.New("") → config.CookieFile()，
+		// 而 CookieFile() 读的是**进程级全局** config.accountID。
+		// 早先这里在 s.mu 之外直接调 task.KeepAlive，全局 accountID 还是
+		// 上一个任务留下的值 —— 于是「保活 A」实际检查的是 B 的 cookie，
+		// 并把 B 的会话当成自己的。多个账号并发点保活时，
+		// A 登录成功后的 cookies 会被写进 B 的 state 目录。
+		//
+		// 用 TryLock 而不是阻塞版：拿不到锁说明有别的账号的长任务在跑，
+		// 此时不能瞎猜，直接回「忙，稍后再试」，绝不读别人的 cookie。
+		var res *task.KeepAliveResult
+		if !s.withAccountTry(id, func() any {
+			r, err := task.KeepAlive(true, 0)
+			if err != nil {
+				r = &task.KeepAliveResult{After: "expired", Message: err.Error()}
+			}
+			res = r
+			return nil
+		}) {
+			// 锁被占：不要退回读全局状态的路径，明确告诉用户稍后再试。
+			// 报「忙」比报一个错的「已在线」安全得多。
+			writeJSON(w, map[string]any{
+				"before":    "",
+				"after":     "busy",
+				"refreshed": false,
+				"message":   "有任务正在执行，账号上下文被占用，请几秒后重试",
+			})
+			return
 		}
 		if res.After != "alive" {
+			// 登录本身不需要账号上下文（Camoufox 按手机号开独立会话，
+			// 写回时 autoLogin 内部会用 withAccountTry 拿锁），所以放锁外。
 			ok, msg := s.autoLogin(id, "保活检查发现会话失效")
 			if ok {
 				res.After = "alive"
@@ -2469,7 +2508,15 @@ func (s *Server) handleCamoufoxLogin(w http.ResponseWriter, r *http.Request) {
 			s.pendingDrop(req.ID)
 		}
 	}
-	s.store.MarkChecked(req.ID, true, phone, 0, "")
+	// 用户名必须从会话里取，不能写手机号。
+	// 早先这里写的是 phone，于是 account.json 里 username 变成手机号，
+	// 而面板卡片和「检查」按钮读的是 cookie 里的真实身份（yd_xxxxxxxxx），
+	// 两处对不上，看起来像串号。
+	if uname := s.currentUsername(req.ID); uname != "" {
+		s.store.MarkChecked(req.ID, true, uname, 0, "")
+	} else {
+		s.store.MarkChecked(req.ID, true, "", 0, "")
+	}
 	// Trusted 按 updateTrustBrowser 的真实结果写，不能无条件置 true：
 	// 设备没被真正信任的话，下次登录还会弹验证码，界面却显示「已信任」，
 	// 排查时会严重误导。
@@ -2497,6 +2544,24 @@ func missingCookies(have map[string]bool) []string {
 		}
 	}
 	return out
+}
+
+// currentUsername 在账号上下文里读一次真实用户名。
+//
+// 必须走 withAccountTry：SessionInfo → huawei.New("") → config.CookieFile()
+// 读的是进程级全局 accountID，不切上下文就会读到别的账号。
+// 拿不到锁返回空串，调用方应把用户名留空，绝不用手机号顶替。
+func (s *Server) currentUsername(id string) string {
+	var uname string
+	s.withAccountTry(id, func() any {
+		if info, err := task.SessionInfo(); err == nil {
+			if v, ok := info["username"].(string); ok {
+				uname = v
+			}
+		}
+		return nil
+	})
+	return uname
 }
 
 // autoLogin 用账号里存的手机号+密码自动登录，成功后把会话写回该账号 state。
@@ -2614,7 +2679,8 @@ func (s *Server) autoLogin(id, reason string) (bool, string) {
 		return markFail("保存会话失败: " + saveErr.Error())
 	}
 
-	s.store.MarkChecked(id, true, acc.Phone, 0, "")
+	// 用户名从会话里读，不要写手机号（见 currentUsername 的注释）
+	s.store.MarkChecked(id, true, s.currentUsername(id), 0, "")
 	_ = s.store.Update(id, func(a *account.Account) {
 		if res.Trusted {
 			a.Trusted = true
