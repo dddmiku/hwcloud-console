@@ -12,12 +12,13 @@
 2. [端口怎么改](#二端口怎么改)
 3. [数据在哪、怎么备份](#三数据在哪怎么备份)
 4. [升级](#四升级)
-5. [华为云自动登录（可选）](#五华为云自动登录可选)
-6. [人工过验证码（VNC）](#六人工过验证码vnc)
-7. [第一次用要做什么](#七第一次用要做什么)
-8. [排障](#八排障)
-9. [卸载](#九卸载)
-10. [资源与安全](#十资源与安全)
+5. [华为云自动登录（已内置）](#五华为云自动登录已内置)
+6. [打码服务（可选，过滑块用）](#五之二打码服务可选过滑块用)
+7. [人工过验证码（VNC）](#六人工过验证码vnc)
+8. [第一次用要做什么](#七第一次用要做什么)
+9. [排障](#八排障)
+10. [卸载](#九卸载)
+11. [资源与安全](#十资源与安全)
 
 ---
 
@@ -204,100 +205,120 @@ docker image inspect ghcr.io/dddmiku/hwcloud-console:latest --format '{{.Created
 
 ---
 
-## 五、华为云自动登录（可选）
+## 五、华为云自动登录（已内置）
 
-### 先说结论：可以不装
+### 结论：不用装
 
-华为云会话能活 **29 天**，手动登一次够用很久。不装的话：
+Camoufox 浏览器（定制 Firefox，约 2.4 GB）**已经打进镜像**。首次启动时
+entrypoint 会自动把它从镜像复制到 `data-runtime/camoufox/`，之后容器重启
+直接复用，镜像升级也不会冲掉。
 
-- ✅ 面板正常
-- ✅ 签到、云实验、提 Issue、Star、活动报名、赛事 —— **全部正常**
-- ❌ 会话失效时，不能自动账密登录，需要你手动点一次「登录」
+为什么必须用它：华为云登录要过**网易易盾滑块**。普通 Chromium 的指纹过不去，
+Playwright 也会被识别，所以只能用 Camoufox 这种内核级指纹伪装的浏览器。
 
-### 什么时候需要装
-
-会话过期了，而你又不想手动登 —— 比如挂在服务器上长期无人值守。
-
-这个功能要过**网易易盾滑块**，必须用 Camoufox（定制 Firefox）。普通 Chromium 的指纹过不去，Playwright 也会被识别。
-
-### 为什么不在镜像里
-
-Camoufox 浏览器本体 **2.4 GB**：
-
-- 塞进去镜像从 1.6 GB 涨到 4 GB，拉取时间翻几倍
-- 多数人用不上（手动登一次能撑一个月）
-- 下载依赖 GitHub，国内经常卡住
-
-所以做成按需安装。
-
-### 装法
-
-在 `deploy/` 目录下：
-
-```bash
-chmod +x install-camoufox.sh
-./install-camoufox.sh
-```
-
-脚本做两件事：
-
-1. 在容器内 `pip install camoufox`（走清华源）
-2. 下载 Camoufox 浏览器到 `data-runtime/camoufox/`（走 gh-proxy 镜像加速，失败自动回退官方源）
-
-约 2.4 GB，视网络需要几分钟到半小时。
-
-装完重启容器：
-
-```bash
-docker compose restart
-```
-
-验证：
-
-```bash
-docker exec hwcloud curl -fsS http://127.0.0.1:8901/health
-```
-
-返回 JSON 就成功了。
-
-### 装完之后
-
-entrypoint 会自动识别并拉起登录服务。看日志确认：
+### 验证是否就绪
 
 ```bash
 docker logs hwcloud | head -8
 ```
 
-看到这行就对了：
+看到这两行就对了：
 
 ```
 [entrypoint] Camoufox 登录服务就绪 (:8901)
+[entrypoint] 启动主进程: hwcloud serve --addr :8899
 ```
 
-没装的话显示的是：
+也可以直接探活：
 
-```
-[entrypoint] 未检测到 Camoufox 浏览器 —— 华为云自动登录不可用
-[entrypoint]   面板和 GitCode 任务（Star / 提 Issue / 活动报名）正常
+```bash
+docker exec hwcloud curl -fsS http://127.0.0.1:8901/health
 ```
 
-### 装了但起不来
+返回 `{"ok": true, "service": "hwlogin-camoufox", ...}` 即正常。
+
+### 起不来怎么办
 
 ```bash
 docker logs hwcloud | grep -i camoufox
 docker exec hwcloud cat /opt/hwcloud-demo/logs/camoufox.log
 ```
 
-常见原因：
-
-| 现象 | 原因 |
+| 现象 | 原因 / 解决 |
 | --- | --- |
-| `pip install` 失败 | 网络问题，重跑一次脚本 |
-| 浏览器下载卡住 | GitHub 被墙，脚本会自动换 gh-proxy 镜像，多等一会 |
-| 服务起来了但登录失败 | 易盾改版了，需要更新 camoufox_server.py |
+| `未检测到 Camoufox 浏览器` | `data-runtime/camoufox/` 被清空了，删掉目录重启容器会重新复制 |
+| 复制很慢 | 2.4 GB 从镜像层复制，首次启动要 1-3 分钟，属正常 |
+| 服务起来了但登录失败 | 易盾改版了，需要更新镜像 |
+
+### 内存要求
+
+Camoufox 常驻约 1 GB。1 GB 内存的机器必须加 swap：
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile
+mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
 
 ---
 
+## 五之二、打码服务（可选，过滑块用）
+
+### 什么时候需要
+
+云实验、GitCode 登录遇到滑块时，需要把背景图和拼图块交给打码服务，
+算出缺口 x 坐标再模拟拖动。
+
+**不配也能用**：签到、发文章、Star、提 Issue、活动报名这些纯 HTTP 任务
+完全不依赖打码服务。只有滑块相关任务会报「未配置打码服务」。
+
+### 怎么配
+
+打码服务的地址和凭据在源码里**不再硬编码**，全部从环境变量读。
+推荐写在 `deploy/.env` 里，这样密码不会进 git：
+
+```bash
+cd deploy
+cp .env.example .env
+vim .env
+```
+
+填这四项：
+
+```bash
+HWCLOUD_CAPTCHA_BASE=https://你的打码服务地址
+HWCLOUD_CAPTCHA_KEY=你的-API-Key
+HWCLOUD_CAPTCHA_USER=登录用户名
+HWCLOUD_CAPTCHA_PASS=登录密码
+```
+
+然后重启容器让它生效：
+
+```bash
+docker compose up -d
+```
+
+`docker-compose.yml` 里已经用 `${HWCLOUD_CAPTCHA_BASE:-}` 的形式引用了这四项，
+`.env` 没配时传空字符串，等于不启用，不会报错。
+
+### 验证
+
+```bash
+docker exec hwcloud env | grep CAPTCHA
+```
+
+能看到四项就说明传进去了。
+
+### 自己搭打码服务
+
+源码 `deploy/camoufox_server.py` 里有一份 AntiCAP 客户端的参考实现，
+接口是：
+
+- `POST /api/login` — 用户名密码换 JWT
+- `POST /api/slider/match` — 传 `target_base64` + `background_base64`，返回缺口 x
+- `POST /api/ocr` — 传 `image`，返回识别文字
+
+---
 ## 六、人工过验证码（VNC）
 
 GitCode 登录偶尔要拖滑块验证码。服务器上没有显示器，用 VNC 看容器里的浏览器画面。

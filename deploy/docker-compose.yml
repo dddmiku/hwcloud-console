@@ -12,11 +12,16 @@
 # 删容器、换镜像、重建都不影响 data-runtime 里的内容。
 # 只有手动 rm -rf data-runtime 才会真正丢数据。
 #
-# ── 华为云自动登录（可选） ──
-# Camoufox 浏览器（约 2.4 GB）**不在镜像里**，需要时自己装：
-#   见 README「华为云自动登录」一节。
-# 装好后它会落在 ./data-runtime/camoufox/，容器重启自动识别，
-# 镜像升级也不会冲掉。
+# ── 华为云自动登录 ──
+# Camoufox 浏览器（约 2.4 GB）**已内置在镜像里**，不用自己装。
+# 首次启动时 entrypoint 会把它从镜像复制到 ./data-runtime/camoufox/，
+# 之后容器重启直接复用，镜像升级也不会冲掉。
+#
+# ── 打码服务（可选） ──
+# 云实验 / GitCode 登录遇到滑块时需要打码服务算缺口位置。
+# 不配的话滑块相关任务会报「未配置打码服务」，签到、发文章、
+# Star、提 Issue 这些纯 HTTP 任务不受影响。
+# 服务地址和凭据在源码里不再硬编码，全部从环境变量读。
 
 services:
   hwcloud:
@@ -39,6 +44,20 @@ services:
       # 需要人工过 GitCode 验证码时设置，会在容器内起 x11vnc（端口 5901）。
       # 设置后记得把 5901 也映射出来，或者用 SSH 隧道。
       # VNC_PASSWORD: "换成你的密码"
+
+      # ── 打码服务（可选，过滑块用）──
+      # 四项都配齐才生效；缺 BASE 或 KEY 时滑块功能直接返回「未配置」。
+      #
+      # 推荐写在同目录的 .env 里（compose 会自动读取），
+      # 这样密码不会进 git：
+      #   cp .env.example .env
+      #   vim .env
+      #
+      # 下面用 ${VAR:-} 引用，.env 没配时传空字符串，等于不启用。
+      HWCLOUD_CAPTCHA_BASE: "${HWCLOUD_CAPTCHA_BASE:-}"
+      HWCLOUD_CAPTCHA_KEY:  "${HWCLOUD_CAPTCHA_KEY:-}"
+      HWCLOUD_CAPTCHA_USER: "${HWCLOUD_CAPTCHA_USER:-}"
+      HWCLOUD_CAPTCHA_PASS: "${HWCLOUD_CAPTCHA_PASS:-}"
 
     volumes:
       # 账号、会话、日志 —— 全部映射到本地，镜像升级不影响

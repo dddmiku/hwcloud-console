@@ -181,6 +181,36 @@ module declares its path as: github.com/mxschmitt/playwright-go
 ./bin/hwcloud status     # 看会话和绑定状态
 ```
 
+### 打码服务（可选）
+
+云实验、GitCode 登录遇到滑块时需要打码服务算缺口位置。**不配也能用** ——
+签到、发文章、Star、提 Issue、活动报名这些纯 HTTP 任务不依赖它，
+只有滑块相关功能会报「未配置打码服务」。
+
+源码里不硬编码凭据，从环境变量读：
+
+```bash
+export HWCLOUD_CAPTCHA_BASE="https://你的打码服务地址"
+export HWCLOUD_CAPTCHA_KEY="你的-API-Key"
+export HWCLOUD_CAPTCHA_USER="登录用户名"
+export HWCLOUD_CAPTCHA_PASS="登录密码"
+```
+
+systemd 部署时写进 unit 的 `Environment=`，或者用 drop-in：
+
+```ini
+# /etc/systemd/system/hwcloud-console.service.d/captcha.conf
+[Service]
+Environment=HWCLOUD_CAPTCHA_BASE=https://你的打码服务地址
+Environment=HWCLOUD_CAPTCHA_KEY=你的-API-Key
+Environment=HWCLOUD_CAPTCHA_USER=登录用户名
+Environment=HWCLOUD_CAPTCHA_PASS=登录密码
+```
+
+```bash
+systemctl daemon-reload && systemctl restart hwcloud-console
+```
+
 ---
 
 ## 三、两种运行方式

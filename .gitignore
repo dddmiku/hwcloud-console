@@ -1,1 +1,39 @@
+# 运行期数据（账号、会话、日志）—— 绝不提交
 state/
+accounts/
+logs/
+data-runtime/
+browser_profile/
+gitcode_profile/
+
+# 凭据文件
+.env
+*.pem
+*.key
+*.token
+
+# 构建产物
+bin/
+hwcloud
+hwcloud-linux
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 排查期的一次性产物
+*.log
+login_trace*.json
+trace_new.json
+*_cookies.json
+hwmeta_cache.txt
+fp_cache.txt
