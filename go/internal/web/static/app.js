@@ -450,6 +450,7 @@ function renderAccount(a){
       act('run', 'eventjoin', '活动报名') +
       gitcodeBtn(a) +
       act('run', 'keepalive', '保活') +
+      act('relogin', '', '重新登录') +
       act('check', '', '检查') +
       act('tasks', '', '任务') +
       '<span class="spacer"></span>' +
@@ -522,6 +523,9 @@ function bindAccountActions(){
         break;
       case 'gitcode': openGitCode(arg || id); break;
       case 'remark': editRemark(arg || id); break;
+      // 重新登录：用服务器上存的账号密码重走一遍完整登录流程
+      // （滑块自动过、短信验证码照常填），不需要用户再输密码。
+      case 'relogin':  startRelogin(id); break;
       case 'check':    checkAccount(id); break;
       case 'tasks':    showTasks(id); break;
       case 'remove':   removeAccount(id); break;
@@ -562,6 +566,29 @@ async function doAdd(){
   }
 }
 
+// startRelogin 用服务器上已保存的账号密码重走一遍登录流程。
+//
+// 跟「添加账号」的区别只有两点：
+//   1. 不用输密码 —— 前端不传 password，后端从 account.json 取
+//   2. 账号已在库里，登录成功不会重复入库，只是覆盖 state 里的 cookie
+//
+// 其余完全一样：Camoufox 开浏览器、自动过易盾滑块、需要时发短信、
+// 用户在弹窗里填验证码。这样「会话彻底失效但保活救不回来」的账号
+// 能一键重新登录，不用删了再加。
+async function startRelogin(id){
+  const a = accounts.find(x => x.id === id);
+  if(!a) return;
+  if(!a.password_saved){
+    // 后端不下发密码，用这个布尔值判断有没有存
+    showMsg('globalMsg', a.phone + ' 没有保存密码，请用「添加账号」重新添加', false);
+    return;
+  }
+  openLogin(id, '', true);
+  showMsg('loginMsg', '正在用已保存的密码登录…', true);
+  // 直接开跑，用户不用再点一次「登录」
+  setTimeout(() => doLogin(), 200);
+}
+
 async function removeAccount(id){
   if(!confirm('确定删除账号 ' + id + ' 及其所有数据？')) return;
   try{
@@ -585,19 +612,45 @@ let cscPopupShown = false; // 防止 onReady 多次触发导致叠层
 let cscSubmitting = false; // 防止重复提交（会形成死循环）
 
 let pendingAccount = null;  // 待定账号：已验密码但还没登录成功
+// loginUseStored=true 表示这次登录用服务器上存的密码，前端不碰密码。
+// 密码只存在于 account.json（0600），浏览器端从来没有拿到过。
+let loginUseStored = false;
 
-function openLogin(id, presetPassword){
+// openLogin 打开登录弹窗。
+//
+// 三种来源：
+//   1. 「添加账号」——密码刚验过，presetPassword 传进来，直接复用
+//   2. 「重新登录」——账号已入库，用服务器上存的密码，不显示密码框
+//   3. 老路径——手动点，自己填手机号和密码
+//
+// useStored=true 时不把密码填进输入框（前端根本拿不到密码，
+// 后端 /api/accounts/camoufox/login 只传 id 就会用 store 里的那份），
+// 同时隐藏手机号和密码两个输入框 —— 避免用户误以为要自己再输一遍。
+function openLogin(id, presetPassword, useStored){
   curAccount = accounts.find(a => a.id === id);
   // 待定账号还不在列表里，用 pendingAccount 兜底
   if(!curAccount && pendingAccount && pendingAccount.id === id){
     curAccount = {id: id, phone: pendingAccount.phone, trusted: false, _pending: true};
   }
   if(!curAccount) return;
-  $('loginTitle').textContent = '登录 ' + curAccount.phone;
-  $('loginSub').textContent = '密码 + 短信验证码；浏览器在服务器上运行，会自动生成可信设备指纹';
+
+  loginUseStored = !!useStored;
+
+  $('loginTitle').textContent = (useStored ? '重新登录 ' : '登录 ') + curAccount.phone;
+  $('loginSub').textContent = useStored
+    ? '使用已保存的账号密码重新登录；需要时按提示填短信验证码'
+    : '密码 + 短信验证码；浏览器在服务器上运行，会自动生成可信设备指纹';
+
+  // useStored 时整块隐藏，只留进度和验证码
+  const credStyle = useStored ? 'none' : '';
+  $('loginPhoneLabel').style.display = credStyle;
+  $('loginPhone').style.display = credStyle;
+  $('loginPwdLabel').style.display = credStyle;
+  $('loginPassword').style.display = credStyle;
+
   $('loginPhone').value = curAccount.phone || curAccount.id || '';
   // 从「添加账号」进来时密码已经填过，直接复用，不用再输一遍
-  $('loginPassword').value = presetPassword || '';
+  $('loginPassword').value = useStored ? '' : (presetPassword || '');
   $('loginCode').value = '';
   $('cscBlock').style.display = 'none';
   $('cscBox').innerHTML = '<div class="csc-hint" id="cscHint">正在启动浏览器…</div>';
@@ -615,7 +668,7 @@ function openLogin(id, presetPassword){
   cscObj = null;
   clearCscOverlays();
   $('loginModal').classList.add('show');
-  $('loginPassword').focus();
+  if(!useStored) $('loginPassword').focus();
 }
 function closeLogin(){
   $('loginModal').classList.remove('show');
@@ -633,6 +686,7 @@ function loginCreds(){
     phone: $('loginPhone').value.trim(),
     password: $('loginPassword').value,
     code: $('loginCode').value.trim(),
+    useStored: loginUseStored,
   };
 }
 
@@ -835,7 +889,8 @@ function handleLoginResult(r, fromCsc){
 // 它比纯协议稳的原因：fp 是每次会话动态生成的，纯协议复用旧值会被判「设备不安全」。
 async function doLogin(){
   const c = loginCreds();
-  if(!c.password) return showMsg('loginMsg', '请填写密码', false);
+  // useStored 时前端没有密码（也不该有），交给后端用 account.json 里的那份。
+  if(!c.password && !c.useStored) return showMsg('loginMsg', '请填写密码', false);
 
   $('btnLogin').disabled = true;
   $('btnLogin').style.display = 'none';
@@ -844,9 +899,15 @@ async function doLogin(){
   showMsg('loginMsg', '浏览器登录中，约 20-40 秒…', true);
 
   try{
+    // useStored 时不传 password 字段 —— 后端看到 id 会自己去 store 里取。
+    // 这样密码永远不会出现在浏览器内存或网络请求里。
+    const body = c.useStored
+      ? {id: curAccount.id, phone: c.phone}
+      : {id: curAccount.id, phone: c.phone, password: c.password};
+
     const r = await api('/api/accounts/camoufox/login', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({id: curAccount.id, phone: c.phone, password: c.password})
+      body: JSON.stringify(body)
     });
 
     if(r.error){ throw new Error(r.error); }
@@ -909,6 +970,8 @@ async function doTrust(){
   $('btnTrust').disabled = true;
   $('cscHint').textContent = '正在提交验证码…';
   try{
+    // 填码阶段同样不带密码：后端按 id 复用 Camoufox 那边已开的会话，
+    // 会话里已经存着手机号，密码用不上。
     const r = await api('/api/accounts/camoufox/login', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({id: curAccount.id, phone: c.phone, sms_code: c.code})

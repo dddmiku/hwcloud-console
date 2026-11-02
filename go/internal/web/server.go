@@ -437,6 +437,9 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			"last_blog":     a.LastBlog,
 			// 只回用户名，密码不回前端
 			"gitcode_user": a.GitCodeUser,
+			// 有没有存密码 —— 前端据此决定「重新登录」能不能点。
+			// 只回布尔值，绝不回密码本身。
+			"password_saved": a.Password != "",
 			// 绑定状态：bound / unbound / error / mismatch / ""（未查询）
 			// 前端必须把 unbound 显眼地标出来 —— 没绑定时 Issue 白提
 			"gitcode_bind_state": a.GitCodeBindState,
@@ -2433,7 +2436,9 @@ func (s *Server) handleCamoufoxLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if password == "" && req.SMSCode == "" {
-		writeJSON(w, map[string]any{"error": "缺少密码"})
+		// 走到这里说明账号在库里但没有存密码（早期加的账号可能为空）。
+		// 前端「重新登录」按钮会先检查 password_saved，正常不会到这。
+		writeJSON(w, map[string]any{"error": "该账号没有保存密码，请用「添加账号」重新添加"})
 		return
 	}
 
