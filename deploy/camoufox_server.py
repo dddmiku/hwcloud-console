@@ -42,10 +42,22 @@ WORK = Path(os.environ.get("HWLOGIN_WORK", "/opt/hwcam/sessions"))
 SMS_TTL = float(os.environ.get("HWLOGIN_SMS_TTL", "480"))
 
 # 打码服务（AntiCAP）
-CAP_BASE = os.environ.get("HWLOGIN_CAP", "https://cap.example.com")
-CAP_KEY = os.environ.get("HWLOGIN_CAP_KEY", "<CAPTCHA_API_KEY>")
-CAP_USER = os.environ.get("HWLOGIN_CAP_USER", "admin")
-CAP_PASS = os.environ.get("HWLOGIN_CAP_PASS", "<CAPTCHA_PASSWORD>")
+#
+# 服务地址和凭据全部从环境变量读，不在源码里写默认值 ——
+# 本仓库是公开的，留个默认密码等于把打码服务送给所有人用。
+# 部署时在 systemd unit 或 docker-compose 里注入这四项：
+#
+#   HWLOGIN_CAP       https://你的打码服务
+#   HWLOGIN_CAP_KEY   X-API-Key
+#   HWLOGIN_CAP_USER  登录用户名
+#   HWLOGIN_CAP_PASS  登录密码
+#
+# 没配置时滑块相关流程会直接报「未配置打码服务」，
+# 不影响免验证登录（设备已信任的账号根本不需要滑块）。
+CAP_BASE = os.environ.get("HWLOGIN_CAP", "")
+CAP_KEY = os.environ.get("HWLOGIN_CAP_KEY", "")
+CAP_USER = os.environ.get("HWLOGIN_CAP_USER", "")
+CAP_PASS = os.environ.get("HWLOGIN_CAP_PASS", "")
 
 LOGIN_URL = (
     "https://auth.huaweicloud.com/authui/login.html"
@@ -139,8 +151,16 @@ def cap_slider_match(bg_bytes, jigsaw_bytes):
 
 class Session:
     def __init__(self, phone, password):
-        self.phone = phone
-        self.password = password
+        # 清洗输入：用户从别处复制账密时经常带上首尾空格、
+        # 不可见字符（NBSP U+00A0、零宽空格 U+200B、BOM U+FEFF），
+        # 甚至换行。直接拿去填表单会「账号或密码错误」，
+        # 但用户肉眼完全看不出来 —— 排查成本极高。
+        #
+        # 手机号：只留数字（去掉空格、横线、括号、+86 之类）
+        # 密码：只去掉首尾空白和零宽字符，**中间的空格要保留**
+        #       （密码里可能有合法的空格）
+        self.phone = self._clean_phone(phone)
+        self.password = self._clean_password(password)
         self.page = None
         self.browser = None
         self.cm = None
@@ -157,18 +177,68 @@ class Session:
         self.stage = "new"
         self.cap = {}
         self.dir = WORK / re.sub(r"[^0-9A-Za-z_.-]", "_", phone)
+        # 建会话目录。这行原来被误放进了 _clean_password 的 return 之后，
+        # 成了永远执行不到的死代码 —— 结果 browser_profile 目录从来没被
+        # 创建过，playwright 用持久化 context 时会自己建，但 clean-locks
+        # 和备份脚本按目录找就会漏。
         self.dir.mkdir(parents=True, exist_ok=True)
+
+    # 需要剥掉的不可见字符。除了常规空白，还有几个从网页/微信/PDF
+    # 复制时经常混进来的：
+    #     不换行空格 (NBSP)      —— 从网页表格复制最常见
+    #   ​ 零宽空格               —— 从微信/QQ 复制常见
+    #   ‌ ‍ 零宽连接符
+    #   ﻿ BOM
+    #   　 全角空格                —— 中文输入法下容易打出来
+    _INVISIBLE = " ​‌‍﻿　  "
+
+    @classmethod
+    def _clean_phone(cls, s):
+        """手机号只留数字。去掉空格、横线、括号、+86 前缀等。"""
+        if not s:
+            return ""
+        s = str(s).translate({ord(c): None for c in cls._INVISIBLE})
+        digits = "".join(ch for ch in s if ch.isdigit())
+        # 去掉国际区号 86（13005999962 是 11 位，8613005999962 是 13 位）
+        if len(digits) == 13 and digits.startswith("86"):
+            digits = digits[2:]
+        return digits
+
+    @classmethod
+    def _clean_password(cls, s):
+        """密码只去掉首尾的空白和不可见字符，中间的原样保留。
+
+        为什么不能全去掉空格：密码里可能有合法的空格，
+        全删会把正确密码改错。
+        """
+        if s is None:
+            return ""
+        s = str(s).translate({ord(c): None for c in cls._INVISIBLE})
+        return s.strip()
 
     @property
     def alive(self):
         return self.page is not None
 
     def sms_age(self):
-        return time.time() - self.sms_sent_at if self.sms_sent_at else -1
+        # 用 getattr 兜底：这个方法是全局 LOCK 持有期间被调的，
+        # 一旦抛 AttributeError 会让整个登录请求 500，而调用方只看到
+        # 「连接 Camoufox 服务失败」，完全看不出是属性缺失。
+        # 实测 2026-11-02 22:20 就栽在这：SESSIONS 里混进了早期代码
+        # 创建的 Session（那时 __init__ 还没有 sms_sent_at），
+        # 四个账号的登录请求全部 500。
+        ts = getattr(self, "sms_sent_at", 0.0)
+        return time.time() - ts if ts else -1
 
     async def _shot(self, name):
+        # 必须加硬超时。华为 CDN（portal.hc-cdn.com）的请求常年不结束，
+        # 页面一直处于 loading 状态，Firefox 的 screenshot 会等页面稳定，
+        # 实测卡死 5 分钟以上，把整个登录流程连同全局 LOCK 一起拖住。
         try:
-            await self.page.screenshot(path=str(self.dir / f"{name}.png"))
+            await asyncio.wait_for(
+                self.page.screenshot(path=str(self.dir / f"{name}.png"),
+                                     timeout=15000),
+                timeout=20)
         except Exception:
             pass
 
@@ -250,7 +320,8 @@ class Session:
 
         self.page.on("response", on_resp)
 
-        await self.page.goto(LOGIN_URL, wait_until="networkidle", timeout=120000)
+        await self.page.goto(LOGIN_URL, wait_until="domcontentloaded",
+                                 timeout=120000)
         await self.page.wait_for_timeout(2000)
 
         for sel in ['text=密码登录', 'a:has-text("密码登录")']:
@@ -265,11 +336,27 @@ class Session:
         await self.page.fill('input.hwid-input-pwd', self.password, timeout=15000)
 
         await self._click_by_text("登录")
-        await self.page.wait_for_timeout(6000)
-        await self._shot("01-submitted")
 
-        # 判定验证类型：滑块 / 短信 / 直接成功
-        kind = await self._detect()
+        # 轮询等待验证框出现，而不是死等 6 秒。
+        #
+        # 为什么必须轮询：开了双重验证（MFA）的账号，弹窗出现得比
+        # 普通账号晚。实测 13005999962 在点击后 6 秒时还没弹，
+        # 6 秒后 _detect 返回 none -> 误判成「免验证」-> 直接 CAS 换票
+        # -> 被弹回登录页，最终 stage=failed。
+        #
+        # 轮询到就立即返回，正常账号不会因此变慢。
+        kind = "none"
+        for _i in range(25):          # 最多 25 秒
+            await self.page.wait_for_timeout(1000)
+            kind = await self._detect()
+            if kind != "none":
+                log(f"[{self.phone}] 第 {_i+1}s 检测到验证类型: {kind}")
+                break
+            # 已经跳到业务页说明真的免验证登录成功
+            if "developer.huaweicloud.com" in self.page.url and "authui" not in self.page.url:
+                break
+
+        await self._shot("01-submitted")
         log(f"[{self.phone}] 验证类型: {kind}")
         # 记下本次是否需要验证。免验证码直接登录成功 = 设备已被华为信任，
         # 这个信号比 updateTrustBrowser 的返回值更可靠：
@@ -317,6 +404,16 @@ class Session:
             log(f"[{self.phone}] 短信已发送，有效期 {int(SMS_TTL)}s")
             return self.stage
 
+        if kind == "badcred":
+            # 账号或密码错误。必须在这里拦下：
+            # 早先没有这个分支，会落到下面的 none，误判成「免验证登录成功」，
+            # 然后去 CAS 换票被弹回，最终报「缺少 SSOTGC/CASTGC」，
+            # 用户完全看不出是密码错了。
+            self.stage = "bad_credentials"
+            self.error = "账号或密码错误，请在面板里更正后重试"
+            log(f"[{self.phone}] 账号或密码错误，终止登录")
+            return self.stage
+
         if kind == "none":
             # 没弹任何验证框就直接进了登录流程 = 设备已被华为信任。
             # 这里必须把 trusted 置 true，否则面板永远显示「未信任」——
@@ -338,6 +435,17 @@ class Session:
         先判 slider 会把已经过了的状态误判成还需要滑块。
         """
         probes = [
+            # 双重验证（MFA）。华为的文案有好几种，实测 2026-11：
+            #   弹窗标题「身份验证」
+            #   正文「您已开启双重验证，为了您的账号安全，请进行身份验证。」
+            #   正文「请输入 130******62 的验证码」
+            # 早先只探测「需要验证您的身份」，开了 MFA 的账号匹配不到，
+            # 被误判成 none（免验证），后续直接去 CAS 换票 -> 被弹回登录页。
+            ("sms", "身份验证"),
+            ("sms", "双重验证"),
+            ("sms", "请输入"),
+            ("sms", "验证码"),
+            # 老文案，保留兼容
             ("sms", "需要验证您的身份"),
             ("slider", "请完成安全验证"),
             ("slider", "向右拖动滑块填充拼图"),
@@ -348,6 +456,30 @@ class Session:
                     return kind
             except Exception:
                 pass
+
+        # 账号/密码错误：页面会显示红字提示，**不会弹任何验证框**。
+        # 这是最容易被误判成 none 的情况 —— 没弹窗 != 登录成功。
+        # 实测文案：「账号或密码错误，建议尝试手机号登录」
+        for txt in ["账号或密码错误", "帐号或密码错误", "密码错误", "账号不存在"]:
+            try:
+                if await self.page.locator(f"text={txt}").count() > 0:
+                    return "badcred"
+            except Exception:
+                pass
+
+        # 交叉验证：页面上有「获取验证码」按钮 = 一定在等短信。
+        # 这个信号比文案可靠，因为按钮是功能性的，改版也大概率保留。
+        try:
+            if await self.page.locator("text=获取验证码").count() > 0:
+                return "sms"
+        except Exception:
+            pass
+        try:
+            if await self.page.locator('input[placeholder*="验证码"]').count() > 0:
+                return "sms"
+        except Exception:
+            pass
+
         # 看有没有登录成功的迹象
         if "developer.huaweicloud.com" in self.page.url:
             return "none"
@@ -1245,8 +1377,25 @@ async def drop_session(phone):
 
 
 async def do_login(phone, password, sms_code):
-    async with LOCK:
+    # LOCK 必须带超时获取。早先是 `async with LOCK` 无限等：
+    # 上一个登录卡死时，后续所有请求会在 LOCK 上排队挂到 HTTP 超时，
+    # 面板表现为「整个服务没反应」。
+    try:
+        await asyncio.wait_for(LOCK.acquire(), timeout=8)
+    except asyncio.TimeoutError:
+        return {"ok": False, "stage": "busy",
+                "error": "上一个登录还在进行（可能卡住了），请点「重置会话」后重试"}
+    try:
         s = SESSIONS.get(phone)
+
+        # 旧会话可能来自更早版本的代码（缺属性），也可能是关闭过程中
+        # 半初始化的对象。这种会话留着只会让后续每一步都抛异常，
+        # 不如直接丢掉重开 —— 重开的成本是一次浏览器启动，
+        # 而带着坏会话跑的成本是用户反复看到「连接服务失败」。
+        if s is not None and not hasattr(s, "sms_sent_at"):
+            log(f"[{phone}] 丢弃残缺会话（缺 sms_sent_at，可能是旧版本残留）")
+            await drop_session(phone)
+            s = None
 
         if sms_code:
             if not s or not s.alive or s.stage != "need_sms":
@@ -1272,7 +1421,15 @@ async def do_login(phone, password, sms_code):
         s = Session(phone, password)
         SESSIONS[phone] = s
         log(f"[{phone}] 新建会话")
-        stage = await s.start()
+        # start() 内部有多个 goto/evaluate，任何一个都可能被 CDN 拖住。
+        # 4 分钟是实测正常流程（~40s）的 6 倍余量。
+        try:
+            stage = await asyncio.wait_for(s.start(), timeout=240)
+        except asyncio.TimeoutError:
+            log(f"[{phone}] start() 超时 240s，清理会话")
+            await drop_session(phone)
+            return {"ok": False, "stage": "timeout",
+                    "error": "登录超时（页面加载卡住），已清理会话，请重试"}
 
         if stage == "need_sms":
             return {"ok": True, "stage": "need_sms", "phone": phone,
@@ -1284,9 +1441,20 @@ async def do_login(phone, password, sms_code):
         if stage in ("slider", "sms_unknown"):
             return {"ok": False, "stage": stage, "error": "需要人工处理验证"}
 
-        res = await s.finish()
+        try:
+            res = await asyncio.wait_for(s.finish(), timeout=180)
+        except asyncio.TimeoutError:
+            log(f"[{phone}] finish() 超时 180s，清理会话")
+            await drop_session(phone)
+            return {"ok": False, "stage": "timeout",
+                    "error": "登录收尾超时（华为页面加载卡住），已清理会话，请重试"}
         await drop_session(phone)
         return res
+    finally:
+        # 无论成功、失败、超时还是异常，LOCK 必须释放，
+        # 否则后续所有登录请求都会卡在 acquire 上。
+        if LOCK.locked():
+            LOCK.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1333,6 +1501,30 @@ class Handler(BaseHTTPRequestHandler):
         phone = (payload.get("phone") or "").strip()
         password = payload.get("password") or ""
         sms = (payload.get("sms_code") or "").strip()
+
+        # /reset 是全局操作，不针对单个账号，不能要求 phone
+        if p == "/reset":
+            n = len(SESSIONS)
+
+            async def _reset_all():
+                for ph in list(SESSIONS.keys()):
+                    s = SESSIONS.pop(ph, None)
+                    if s:
+                        try:
+                            await s.close()
+                        except Exception:
+                            pass
+                if LOCK.locked():
+                    try:
+                        LOCK.release()
+                    except Exception:
+                        pass
+                log(f"[reset] 已清理 {n} 个会话并释放 LOCK")
+
+            asyncio.run_coroutine_threadsafe(_reset_all(), LOOP)
+            self._json(200, {"ok": True, "cleared": n})
+            return
+
         if not phone:
             self._json(400, {"ok": False, "error": "phone required"})
             return
