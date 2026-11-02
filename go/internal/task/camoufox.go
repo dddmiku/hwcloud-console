@@ -127,6 +127,36 @@ func CamoufoxLogin(phone, password, smsCode string) (*CamoufoxResult, error) {
 	return camoufoxPost("/login", payload, 280*time.Second)
 }
 
+// CamoufoxLogout 让服务端丢弃该账号的会话并关闭浏览器。
+//
+// 为什么需要：Camoufox 是单实例服务，一个账号开着的浏览器会一直占着
+// 全局 LOCK 和 1-2 GB 内存。用户关了登录弹窗（典型场景：等短信等到一半
+// 不想等了），浏览器不会自己退出 —— 后续所有账号的登录都会卡在 LOCK 上，
+// 最终报「连接 Camoufox 服务失败」，而没人知道是自己没填验证码导致的。
+//
+// 超时给 30 秒：关闭浏览器要等 profile 里的 SQLite WAL 落盘，
+// 正常 2-3 秒，给足余量但不至于卡住 UI。
+func CamoufoxLogout(phone string) error {
+	body, _ := json.Marshal(map[string]any{"phone": phone})
+	req, err := http.NewRequest(http.MethodPost, CamoufoxBase()+"/logout", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("通知 Camoufox 关闭会话失败: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("关闭会话返回 HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // SaveCamoufoxArtifacts 把 Camoufox 会话产物写进当前账号的 state 目录。
 //
 // cookies 用 Playwright 原始 domain/path，比纯协议里手工拼的 pathFor 更准，

@@ -214,6 +214,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/accounts/csc/sms", guard(s.handleCscSMS))
 	mux.HandleFunc("/api/accounts/camoufox/health", guard(s.handleCamoufoxHealth))
 	mux.HandleFunc("/api/accounts/camoufox/login", guard(s.handleCamoufoxLogin))
+	mux.HandleFunc("/api/accounts/camoufox/logout", guard(s.handleCamoufoxLogout))
 	mux.HandleFunc("/api/accounts/gitcode", guard(s.handleGitCodeCreds))
 	mux.HandleFunc("/api/accounts/gitcode/bindstate", guard(s.handleGitCodeBindState))
 	mux.HandleFunc("/api/accounts/run", guard(s.handleRunTask))
@@ -2396,6 +2397,53 @@ func (s *Server) handleCamoufoxHealth(w http.ResponseWriter, r *http.Request) {
 		"info":   info,
 		"target": task.CamoufoxBase(),
 	})
+}
+
+// handleCamoufoxLogout 关闭某个账号在 Camoufox 里开着的浏览器。
+//
+// 触发场景：用户关掉登录弹窗。典型是「等短信验证码等到一半不想等了」，
+// 或者点错了账号。不关的话浏览器会一直占着 LOCK 和内存，
+// 后续所有登录请求都排队，最终报「连接 Camoufox 服务失败」。
+//
+// 这是个清理动作，失败也不该让用户看到错误 —— 前端本来就不等它。
+// 但日志要留痕，否则下次排查「为什么浏览器没退」又得猜。
+func (s *Server) handleCamoufoxLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		ID    string `json:"id"`
+		Phone string `json:"phone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// 手机号优先从账号库里取，避免前端传错或传空
+	phone := req.Phone
+	if phone == "" && req.ID != "" {
+		if acc, ok := s.store.Get(req.ID); ok {
+			phone = acc.Phone
+		}
+	}
+	if phone == "" {
+		phone = req.ID
+	}
+	if phone == "" {
+		writeJSON(w, map[string]any{"ok": false, "error": "缺少账号"})
+		return
+	}
+
+	if err := task.CamoufoxLogout(phone); err != nil {
+		svcLog("[logout] %s 关闭 Camoufox 会话失败: %v", phone, err)
+		// 仍然返回 ok：前端是 fire-and-forget，报错只会干扰用户。
+		writeJSON(w, map[string]any{"ok": true, "warning": err.Error()})
+		return
+	}
+	svcLog("[logout] %s 已关闭 Camoufox 会话", phone)
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // handleCamoufoxLogin 用 Camoufox 提交账密 / 短信码。

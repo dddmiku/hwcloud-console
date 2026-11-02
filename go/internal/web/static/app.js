@@ -670,14 +670,38 @@ function openLogin(id, presetPassword, useStored){
   $('loginModal').classList.add('show');
   if(!useStored) $('loginPassword').focus();
 }
+// closeLogin 关闭登录弹窗。
+//
+// 【必须通知后端释放浏览器】
+//
+// Camoufox 是单实例服务，一个账号开着的浏览器会一直占着 LOCK 和
+// 那 1-2 GB 内存。用户关了弹窗（尤其是「等短信但不想等了」的情况），
+// 浏览器不会自己退出 —— 实测两个账号这么挂着，后面所有登录请求
+// 都在 LOCK 上排队，最终报「连接 Camoufox 服务失败」，
+// 而用户完全不知道是自己没填验证码导致的。
+//
+// 所以关闭时主动调 /logout 让服务端 drop_session → close()。
+// 用 keepalive:true 是为了关页面时请求也能发出去。
 function closeLogin(){
   $('loginModal').classList.remove('show');
+
+  // 释放服务端会话。不阻塞 UI，失败也不弹错 ——
+  // 用户点「关闭」就是想立刻脱身，不该被一个清理请求拖住。
+  const id = curAccount && curAccount.id;
+  if(id){
+    api('/api/accounts/camoufox/logout', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id})
+    }).catch(() => {});
+  }
+
   cscState = null;
   cscStarting = false;
   cscPopupShown = false;
   try{ if(cscObj && typeof cscObj.destroy === 'function') cscObj.destroy(); }catch(e){}
   cscObj = null;
   clearCscOverlays();
+  if(smsTimer){ clearInterval(smsTimer); smsTimer = null; }
 }
 
 function loginCreds(){

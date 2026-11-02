@@ -42,18 +42,6 @@ WORK = Path(os.environ.get("HWLOGIN_WORK", "/opt/hwcam/sessions"))
 SMS_TTL = float(os.environ.get("HWLOGIN_SMS_TTL", "480"))
 
 # 打码服务（AntiCAP）
-#
-# 服务地址和凭据全部从环境变量读，不在源码里写默认值 ——
-# 本仓库是公开的，留个默认密码等于把打码服务送给所有人用。
-# 部署时在 systemd unit 或 docker-compose 里注入这四项：
-#
-#   HWLOGIN_CAP       https://你的打码服务
-#   HWLOGIN_CAP_KEY   X-API-Key
-#   HWLOGIN_CAP_USER  登录用户名
-#   HWLOGIN_CAP_PASS  登录密码
-#
-# 没配置时滑块相关流程会直接报「未配置打码服务」，
-# 不影响免验证登录（设备已信任的账号根本不需要滑块）。
 CAP_BASE = os.environ.get("HWLOGIN_CAP", "")
 CAP_KEY = os.environ.get("HWLOGIN_CAP_KEY", "")
 CAP_USER = os.environ.get("HWLOGIN_CAP_USER", "")
@@ -1457,6 +1445,50 @@ async def do_login(phone, password, sms_code):
             LOCK.release()
 
 
+# 会话最长存活时间。超过就自动关闭浏览器。
+#
+# 为什么必须自动回收：
+#   need_sms 状态的会话要等用户填验证码，用户可能关掉弹窗、关掉标签页、
+#   或者干脆走开了。浏览器不会自己退出，一直占着 1-2 GB 内存和全局 LOCK。
+#   实测两个这样的僵尸会话挂 40 分钟，后续所有账号的登录全部排队超时，
+#   报「连接 Camoufox 服务失败」，没人知道是「验证码没人填」导致的。
+#
+# 取 SMS_TTL + 2 分钟：短信有效期 480s，再加点余量给用户输码。
+# 最短 10 分钟，避免 SMS_TTL 被调小时回收得太激进。
+SESSION_MAX_AGE = max(float(os.environ.get("HWLOGIN_SESSION_MAX", "0")) or 0,
+                      SMS_TTL + 120, 600)
+
+
+async def _reaper():
+    """后台线程：定期关掉超龄会话。"""
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        for ph in list(SESSIONS.keys()):
+            s = SESSIONS.get(ph)
+            if not s:
+                continue
+            age = now - getattr(s, "created", now)
+            # 正在跑登录流程的不动（stage 还在推进）
+            if s.stage in ("new", "checking"):
+                if age < 900:      # 15 分钟还没推进 = 卡死
+                    continue
+            if age > SESSION_MAX_AGE:
+                log(f"[reaper] {ph} 会话存活 {int(age)}s（上限 {int(SESSION_MAX_AGE)}s），自动关闭")
+                try:
+                    await drop_session(ph)
+                except Exception as e:
+                    log(f"[reaper] {ph} 关闭失败: {e}")
+                    SESSIONS.pop(ph, None)
+
+
+def _start_reaper():
+    if LOOP is None:
+        return
+    asyncio.run_coroutine_threadsafe(_reaper(), LOOP)
+    log(f"会话回收线程已启动（上限 {int(SESSION_MAX_AGE)}s）")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1485,6 +1517,7 @@ class Handler(BaseHTTPRequestHandler):
                 "display": os.environ.get("DISPLAY", ""),
                 "sessions": len(SESSIONS), "detail": info,
                 "sms_ttl": int(SMS_TTL),
+                "session_max_age": int(SESSION_MAX_AGE),
             })
             return
         self._json(404, {"ok": False, "error": "not found"})
@@ -1562,6 +1595,7 @@ def main():
     threading.Thread(target=LOOP.run_forever, daemon=True).start()
     log(f"hwlogin 服务启动 :{PORT} work={WORK} display={os.environ.get('DISPLAY','')} "
         f"sms_ttl={int(SMS_TTL)}s cap={CAP_BASE}")
+    _start_reaper()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.serve_forever()
 
