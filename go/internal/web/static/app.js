@@ -101,16 +101,43 @@ function showAuthScreen(reason){
 // 等多个消息框，共用一个 timer 会让它们互相取消。
 const msgHideTimers = new Map();
 
-function showMsg(el, text, ok){
+// showMsg 显示一条消息。
+//
+// opts.sticky = true 表示「常驻消息」：不挂自动隐藏定时器。
+//
+// 【为什么需要 sticky】
+//
+// 后台任务进度每 3 秒刷一次，但秒数取整到 10 秒才变一次文字。
+// 如果照常挂「6 秒后隐藏」的定时器，就会出现：
+//
+//   t=0   文字变了 → 显示，挂定时器(6s)
+//   t=3   文字没变 → 早退，定时器继续跑
+//   t=6   定时器触发 → 隐藏 ❌
+//   t=6   轮询发现 className 变了 → 重新显示 ✅
+//   t=12  定时器又触发 → 隐藏 ❌
+//
+// 表现为消息条一直闪。任务在跑的时候进度就该一直可见，
+// 所以进度消息一律用 sticky，只有终态消息（完成/失败）才自动隐藏。
+function showMsg(el, text, ok, opts){
   const box = $(el);
   if(!box) return;
+  const sticky = !!(opts && opts.sticky);
+
+  // 常驻消息：先清掉可能残留的隐藏定时器（比如上一轮是终态消息挂的）
+  if(sticky){
+    const old = msgHideTimers.get(el);
+    if(old){ clearTimeout(old); msgHideTimers.delete(el); }
+  }
 
   const cls = 'msg show ' + (ok ? 'ok' : 'err');
-  // 内容没变就什么都不做 —— 这是消除闪烁的关键
+  // 内容和状态都没变就不碰 DOM —— 这是消除闪烁的第一道闸
   if(box.textContent === text && box.className === cls) return;
 
   if(box.textContent !== text) box.textContent = text;
   if(box.className !== cls) box.className = cls;
+
+  // 常驻消息不挂隐藏定时器
+  if(sticky) return;
 
   // 只保留该元素的一个隐藏定时器，避免多个定时器互相打架
   const old = msgHideTimers.get(el);
@@ -1175,8 +1202,13 @@ function pollJob(jobId, label){
         // 原来每 3 秒刷一次「已 N 秒」，数字一直在跳，看起来像闪烁。
         // 实际上后台任务的进度本来就是分钟级的，秒数没必要实时 ——
         // 取整到 10 秒既够看又不闹眼睛。
+        //
+        // sticky: 任务在跑，这条消息必须常驻，不能挂 6 秒自动隐藏 ——
+        // 否则定时器一到就把进度藏起来，下一轮轮询又显示，来回闪。
         const shown = Math.floor(elapsed / 10) * 10;
-        showMsg('globalMsg', label + ' 执行中…（' + j.step + '，已 ' + shown + ' 秒）', true);
+        showMsg('globalMsg',
+          label + ' 执行中…（' + j.step + '，已 ' + shown + ' 秒）',
+          true, {sticky: true});
         return;
       }
 
