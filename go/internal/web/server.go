@@ -553,7 +553,7 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 
 	// 积分缓存：命中就不用再去远程查。
 	//
-	// 注意必须在拿账号锁**之前**读缓存，且只在同一把锁内使用缓存值 ——
+	// 注意这里必须在拿账号锁**之前**读缓存，且只在同一把锁内使用缓存值 ——
 	// 见下面「为什么必须合并成一次 withAccountTry」的说明。
 	beansCached, beansHit := 0, false
 	s.beansMu.Lock()
@@ -574,7 +574,9 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 	// 只要中间有别的 goroutine 拿了锁并把 accountID 改成 B，
 	// 第二次就会读 B 的 cookies，把 B 的积分记到 A 头上。
 	//
-	// 实测症状：面板上多个账号显示同一个用户名、同一份积分。
+	// 实测症状（2026-11-02）：面板上 4 个账号里有两个显示同一个
+	// 用户名 yd_260581878、同一份积分 430 —— 那就是串号。
+	// 用户一眼就看出「直接混乱了都」。
 	//
 	// 会话检查和积分都依赖 config.CookieFile()（= 全局 accountID），
 	// 所以它们必须在**同一次**持锁期间完成，不能拆开。
@@ -1256,19 +1258,24 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 		// KeepAlive → huaweiSession() → huawei.New("") → config.CookieFile()，
 		// 而 CookieFile() 读的是**进程级全局** config.accountID。
 		// 早先这里在 s.mu 之外直接调 task.KeepAlive，全局 accountID 还是
-		// 上一个任务留下的值 —— 于是「保活 A」实际检查的是 B 的 cookie，
-		// 并把 B 的会话当成自己的。多个账号并发点保活时，
-		// A 登录成功后的 cookies 会被写进 B 的 state 目录。
+		// 上一个任务留下的值 —— 于是「保活账号 A」实际检查的是
+		// 别的账号的 cookie，并把那个账号的会话当成自己的。
+		//
+		// 实测症状（2026-11-02 10:19）：三个账号的保活并发进来，
+		// 账号 A 登录成功后，它的 cookies.json 被写进了
+		// 账号 B 的 state 目录，两个号在面板上显示成同一个人
+		// （同用户名、同积分）。
 		//
 		// 用 TryLock 而不是阻塞版：拿不到锁说明有别的账号的长任务在跑，
 		// 此时不能瞎猜，直接回「忙，稍后再试」，绝不读别人的 cookie。
 		var res *task.KeepAliveResult
+		var lockErr error
 		if !s.withAccountTry(id, func() any {
 			r, err := task.KeepAlive(true, 0)
 			if err != nil {
 				r = &task.KeepAliveResult{After: "expired", Message: err.Error()}
 			}
-			res = r
+			res, lockErr = r, err
 			return nil
 		}) {
 			// 锁被占：不要退回读全局状态的路径，明确告诉用户稍后再试。
@@ -1281,6 +1288,7 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		_ = lockErr
 		if res.After != "alive" {
 			// 登录本身不需要账号上下文（Camoufox 按手机号开独立会话，
 			// 写回时 autoLogin 内部会用 withAccountTry 拿锁），所以放锁外。
@@ -2509,9 +2517,14 @@ func (s *Server) handleCamoufoxLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 用户名必须从会话里取，不能写手机号。
-	// 早先这里写的是 phone，于是 account.json 里 username 变成手机号，
-	// 而面板卡片和「检查」按钮读的是 cookie 里的真实身份（yd_xxxxxxxxx），
-	// 两处对不上，看起来像串号。
+	//
+	// 早先这里写的是 phone，于是 account.json 里 username 变成
+	// 「13800138000」这种手机号，而面板卡片和「检查」按钮读的是
+	// cookie 里的真实身份（yd_xxxxxxxxx）—— 两处对不上，用户看到
+	// 一个号显示两种用户名，以为是串号。
+	//
+	// res 里没有 username，所以这里取一次 SessionInfo；取不到就留空，
+	// 让下一次「检查」去填，不要拿手机号冒充。
 	if uname := s.currentUsername(req.ID); uname != "" {
 		s.store.MarkChecked(req.ID, true, uname, 0, "")
 	} else {

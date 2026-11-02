@@ -8,27 +8,43 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 )
 
 // 打码服务客户端（AntiCAP）。
 //
-// 服务地址：https://cap.example.com
 // 鉴权：先 X-API-Key 换 JWT，再用 Bearer 调识别接口。
 // JWT 有效期很长（exp 约 10 年），缓存在内存里复用。
-const (
-	captchaAPIBase = "https://cap.example.com"
-	captchaAPIKey  = "<CAPTCHA_API_KEY>"
-	captchaUser    = "admin"
-	captchaPass    = "<CAPTCHA_PASSWORD>"
-)
-
+//
+// 服务地址和凭据全部从环境变量读，不写死在源码里 ——
+// 本仓库是公开的，硬编码等于把打码服务送给所有人用。
+//
+//	HWCLOUD_CAPTCHA_BASE  https://你的打码服务
+//	HWCLOUD_CAPTCHA_KEY   X-API-Key
+//	HWCLOUD_CAPTCHA_USER  登录用户名
+//	HWCLOUD_CAPTCHA_PASS  登录密码
+//
+// 不配置时滑块/OCR 相关功能直接返回「未配置」，不影响签到、文章等纯 HTTP 任务。
 var (
 	captchaMu    sync.Mutex
 	captchaToken string
 	captchaExp   time.Time
 )
+
+func captchaAPIBase() string { return os.Getenv("HWCLOUD_CAPTCHA_BASE") }
+func captchaAPIKey() string { return os.Getenv("HWCLOUD_CAPTCHA_KEY") }
+func captchaUser() string   { return os.Getenv("HWCLOUD_CAPTCHA_USER") }
+func captchaPass() string   { return os.Getenv("HWCLOUD_CAPTCHA_PASS") }
+
+// captchaConfigured 判断是否配了打码服务，没配就别发请求了。
+func captchaConfigured() error {
+	if captchaAPIBase() == "" || captchaAPIKey() == "" {
+		return fmt.Errorf("未配置打码服务：请设置 HWCLOUD_CAPTCHA_BASE / HWCLOUD_CAPTCHA_KEY")
+	}
+	return nil
+}
 
 // captchaHTTP 是打码服务专用的 HTTP 客户端。
 var captchaHTTP = &http.Client{Timeout: 30 * time.Second}
@@ -38,19 +54,23 @@ func captchaLogin() (string, error) {
 	captchaMu.Lock()
 	defer captchaMu.Unlock()
 
+	if err := captchaConfigured(); err != nil {
+		return "", err
+	}
+
 	if captchaToken != "" && time.Now().Before(captchaExp) {
 		return captchaToken, nil
 	}
 
 	form := url.Values{}
-	form.Set("username", captchaUser)
-	form.Set("password", captchaPass)
+	form.Set("username", captchaUser())
+	form.Set("password", captchaPass())
 
-	req, err := http.NewRequest(http.MethodPost, captchaAPIBase+"/api/login", bytes.NewBufferString(form.Encode()))
+	req, err := http.NewRequest(http.MethodPost, captchaAPIBase()+"/api/login", bytes.NewBufferString(form.Encode()))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("X-API-Key", captchaAPIKey)
+	req.Header.Set("X-API-Key", captchaAPIKey())
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := captchaHTTP.Do(req)
@@ -92,11 +112,11 @@ func SliderMatch(targetB64, backgroundB64 string) (int, error) {
 	}
 	data, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest(http.MethodPost, captchaAPIBase+"/api/slider/match", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, captchaAPIBase()+"/api/slider/match", bytes.NewReader(data))
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("X-API-Key", captchaAPIKey)
+	req.Header.Set("X-API-Key", captchaAPIKey())
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -137,11 +157,11 @@ func OCRBase64(imgB64 string) (string, error) {
 	payload := map[string]string{"image": imgB64}
 	data, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest(http.MethodPost, captchaAPIBase+"/api/ocr", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, captchaAPIBase()+"/api/ocr", bytes.NewReader(data))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("X-API-Key", captchaAPIKey)
+	req.Header.Set("X-API-Key", captchaAPIKey())
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
