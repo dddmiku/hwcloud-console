@@ -797,6 +797,15 @@ func (s *Server) handleAccountRemark(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "remark": remark})
 }
 
+// 从 map[string]any 里安全取值的小工具。
+// 直接写 v, _ := m["k"].(T) 到处都是，容易漏判 nil 造成误报。
+func boolOf(v any) bool   { b, _ := v.(bool); return b }
+func strOf(v any) string  { s, _ := v.(string); return s }
+func floatOf(v any) float64 {
+	f, _ := v.(float64)
+	return f
+}
+
 // handleCheckAccount 检查单个账号。
 func (s *Server) handleCheckAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
@@ -811,46 +820,39 @@ func (s *Server) handleCheckAccount(w http.ResponseWriter, r *http.Request) {
 	// 云实验），「检查」按钮会一直转圈，用户以为没反应。更糟的是
 	// 探测拿不到锁时会回退成 alive=false，界面显示「离线」——
 	// 而账号其实好好的，只是锁被占用。这是把「锁竞争」误报成「账号离线」。
-	var alive bool
-	var username string
-	var remain float64
-	locked := s.withAccountTry(id, func() any {
-		info, err := task.SessionInfo()
-		if err != nil {
-			return nil
-		}
-		if v, ok := info["alive"].(bool); ok {
-			alive = v
-		}
-		if v, ok := info["username"].(string); ok {
-			username = v
-		}
-		if v, ok := info["auth_remaining_days"].(float64); ok {
-			remain = v
-		}
-		return nil
-	})
-
-	out := map[string]any{"id": id}
-	if locked {
-		out["alive"] = alive
-		out["username"] = username
-		out["remain_days"] = remain
-		out["stale"] = false
-	} else {
-		// 锁被占：返回上次缓存，明确告诉前端「这是旧数据」
-		if snap, ok := s.cachedProbe(id); ok {
-			out["alive"] = snap.Alive
-			out["username"] = snap.Username
-			out["remain_days"] = snap.Remain
-			out["stale"] = true
-			out["stale_reason"] = "有任务正在执行，显示的是上次检查结果"
-		} else {
-			out["alive"] = nil
-			out["stale"] = true
-			out["stale_reason"] = "有任务正在执行，暂时无法检查"
-		}
+	// 用无锁版本：SessionInfoFor 直接读该账号的 state 目录，
+	// 不碰全局 accountID，所以长任务持锁时也能立刻返回真实结果，
+	// 不再退化成「有任务正在执行，显示的是上次检查结果」。
+	stateDir := filepath.Join(config.Root(), "accounts", id, "state")
+	info, err := task.SessionInfoFor(stateDir)
+	out := map[string]any{"id": id, "stale": false}
+	if err != nil {
+		// 读不到就如实说，不要拿旧缓存冒充当前状态
+		out["alive"] = nil
+		out["stale"] = true
+		out["stale_reason"] = err.Error()
+		writeJSON(w, out)
+		return
 	}
+	if v, ok := info["alive"].(bool); ok {
+		out["alive"] = v
+	}
+	if v, ok := info["username"].(string); ok {
+		out["username"] = v
+	}
+	if v, ok := info["auth_remaining_days"].(float64); ok {
+		out["remain_days"] = v
+	}
+	// 顺手更新探测缓存，账号卡片下次刷新能直接看到
+	s.probeMu.Lock()
+	s.probeCache[id] = probeSnapshot{
+		Alive:    boolOf(info["alive"]),
+		Username: strOf(info["username"]),
+		Remain:   floatOf(info["auth_remaining_days"]),
+		Beans:    -1,
+		At:       time.Now(),
+	}
+	s.probeMu.Unlock()
 	writeJSON(w, out)
 }
 
@@ -1328,7 +1330,7 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	// 早先这里是 withAccountTry：拿不到锁就报「账号上下文被占用」。
 	// 那只是把「排队 10 分钟」换成了「直接失败」，用户还是查不了。
 	// 现在真正绕开锁，任何时候点都能秒回。
-	if name == "tasks" || name == "beans" {
+	if name == "tasks" || name == "beans" || name == "session" {
 		stateDir := filepath.Join(config.Root(), "accounts", id, "state")
 		sess, err := huawei.NewForAccount(stateDir)
 		if err != nil {
@@ -1347,6 +1349,16 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 			s.beansCache[id] = beanEntry{val: n, at: time.Now()}
 			s.beansMu.Unlock()
 			writeJSON(w, map[string]any{"beans": n, "username": sess.Username})
+			return
+		}
+
+		if name == "session" {
+			info, err := task.SessionInfoFor(stateDir)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, info)
 			return
 		}
 
@@ -1616,13 +1628,6 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 
 		case "weekly":
 			return s.runWeekly()
-
-		case "session":
-			info, err := task.SessionInfo()
-			if err != nil {
-				return map[string]any{"error": err.Error()}
-			}
-			return info
 
 		default:
 			return map[string]any{"error": "unknown task"}

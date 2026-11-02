@@ -256,7 +256,13 @@ var keepaliveCookies = map[string]bool{
 // authExpiry 返回真正决定登录态的那个 cookie 的过期时间。
 // 优先用 refresh token（HW_refts_*），它才是会话能否续期的根。
 func authExpiry() (time.Time, string, bool) {
-	data, err := os.ReadFile(config.CookieFile())
+	return authExpiryIn(config.CookieFile())
+}
+
+// authExpiryIn 同 authExpiry，但显式指定 cookie 文件路径。
+// 供不依赖全局 accountID 的调用方使用（见 SessionInfoFor）。
+func authExpiryIn(cookieFile string) (time.Time, string, bool) {
+	data, err := os.ReadFile(cookieFile)
 	if err != nil {
 		return time.Time{}, "", false
 	}
@@ -493,6 +499,69 @@ func SessionInfo() (map[string]any, error) {
 	// 顺带给出 WAF 短效 cookie 的信息（仅供排查，过期不影响登录）
 	data, err := os.ReadFile(config.CookieFile())
 	if err == nil {
+		var list []struct {
+			Name    string  `json:"name"`
+			Expires float64 `json:"expires"`
+		}
+		if json.Unmarshal(data, &list) == nil {
+			var earliest float64
+			var earliestName string
+			for _, c := range list {
+				if c.Expires <= 0 {
+					continue
+				}
+				if earliest == 0 || c.Expires < earliest {
+					earliest = c.Expires
+					earliestName = c.Name
+				}
+			}
+			if earliest > 0 {
+				t := time.Unix(int64(earliest), 0)
+				out["shortest_expiry"] = t.Format("2006-01-02 15:04:05")
+				out["shortest_cookie"] = earliestName
+				out["shortest_remaining_hours"] = time.Until(t).Hours()
+			}
+		}
+	}
+	return out, nil
+}
+
+// SessionInfoFor 是 SessionInfo 的「不依赖全局 accountID」版本。
+//
+// 为什么需要：SessionInfo 内部走 huaweiSession() → huawei.New("") →
+// config.CookieFile()，而 CookieFile() 从进程级全局变量推导路径。
+// 所以调用方必须先拿全局锁把 accountID 切到目标账号 —— 而周常/保活
+// 这类长任务会把锁持有 5-10 分钟，期间点「检查」只能干等或报忙。
+//
+// 这个版本直接接收账号 state 目录，不碰任何全局状态，可以并发调用。
+// dir 形如 /opt/hwcloud-demo/accounts/<phone>/state。
+func SessionInfoFor(dir string) (map[string]any, error) {
+	sess, err := huawei.NewForAccount(dir)
+	if err != nil {
+		return nil, err
+	}
+	info, err := sess.CheckLogin()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{"alive": info != nil}
+	if info == nil {
+		return out, nil
+	}
+	out["username"] = sess.Username
+
+	cookieFile := filepath.Join(dir, "cookies.json")
+
+	// 报告真正决定登录态的凭据（refresh token），而不是 WAF 短效 cookie
+	if t, name, ok := authExpiryIn(cookieFile); ok {
+		out["auth_expiry"] = t.Format("2006-01-02 15:04:05")
+		out["auth_cookie"] = name
+		out["auth_remaining_hours"] = time.Until(t).Hours()
+		out["auth_remaining_days"] = time.Until(t).Hours() / 24
+	}
+
+	// 顺带给出 WAF 短效 cookie 的信息（仅供排查，过期不影响登录）
+	if data, err := os.ReadFile(cookieFile); err == nil {
 		var list []struct {
 			Name    string  `json:"name"`
 			Expires float64 `json:"expires"`
