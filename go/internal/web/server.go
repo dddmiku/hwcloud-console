@@ -1317,86 +1317,54 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 积分查询：纯 HTTP，同样不该排长任务的队。
+	// ── 纯查询类任务：完全不需要全局锁 ──
 	//
-	// 和 tasks 一样走 withAccountTry —— 拿不到锁就报忙，不阻塞。
-	// 用 BeansE 而不是 Beans：后者失败时返回 0，用户会以为积分清零了。
-	if name == "beans" {
-		var out map[string]any
-		if !s.withAccountTry(id, func() any {
-			sess, err := huawei.New("")
-			if err != nil {
-				out = map[string]any{"error": err.Error()}
-				return nil
-			}
-			n, err := sess.BeansE()
-			if err != nil {
-				out = map[string]any{"error": err.Error()}
-				return nil
-			}
-			out = map[string]any{"beans": n, "username": sess.Username}
-			return nil
-		}) {
-			writeJSON(w, map[string]any{
-				"error": "有任务正在执行，账号上下文被占用，请稍后再查积分",
-				"busy":  true,
-			})
+	// 为什么能做到：config.SetAccount 是进程级全局变量，CookieFile() 和
+	// UserAgent() 都从它推导路径，所以常规代码必须先拿 s.mu 切上下文。
+	// 但 huawei.NewForAccount(dir) 直接接收账号目录，不碰任何全局状态 ——
+	// 于是「任务」「积分」这类 1 秒的纯 HTTP 查询可以并发执行，
+	// 完全不受周常/保活这类长任务影响。
+	//
+	// 早先这里是 withAccountTry：拿不到锁就报「账号上下文被占用」。
+	// 那只是把「排队 10 分钟」换成了「直接失败」，用户还是查不了。
+	// 现在真正绕开锁，任何时候点都能秒回。
+	if name == "tasks" || name == "beans" {
+		stateDir := filepath.Join(config.Root(), "accounts", id, "state")
+		sess, err := huawei.NewForAccount(stateDir)
+		if err != nil {
+			writeJSON(w, map[string]any{"error": "读取会话失败: " + err.Error()})
 			return
 		}
-		// 顺手更新缓存，面板卡片下次刷新就能看到新积分
-		if n, ok := out["beans"].(int); ok {
+
+		if name == "beans" {
+			n, err := sess.BeansE()
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			// 顺手更新缓存，面板卡片下次刷新就能看到新积分
 			s.beansMu.Lock()
 			s.beansCache[id] = beanEntry{val: n, at: time.Now()}
 			s.beansMu.Unlock()
-		}
-		writeJSON(w, out)
-		return
-	}
-
-	// 任务列表是只读的纯 HTTP 请求，不该排长任务的队。
-	//
-	// 为什么单独拎出来：所有 case 都在 s.withAccount 里执行，而那是
-	// **全局锁**（不是按账号分的）—— config.SetAccount 是进程级全局变量，
-	// huawei.New("") 靠它定位 cookie 文件，所以同一时刻只能有一个账号
-	// 在跑。周常持锁 10 分钟，点「任务」就得干等 10 分钟。
-	//
-	// 用户的原话：「任务列表拉不下拉，这个不是纯协议吗，为啥也要等」。
-	// 纯协议确实很快（~1 秒），等的是锁，不是网络。
-	//
-	// 这里用 withAccountTry：拿不到锁立刻返回「忙」，让前端提示用户
-	// 稍后再点，而不是让请求在队列里挂到 HTTP 超时（前端 4 分钟）。
-	if name == "tasks" {
-		var out map[string]any
-		if !s.withAccountTry(id, func() any {
-			sess, err := huawei.New("")
-			if err != nil {
-				out = map[string]any{"error": err.Error()}
-				return nil
-			}
-			missions, err := huawei.TasksByStar(sess, 1, 2, 3, 4, 5)
-			if err != nil {
-				out = map[string]any{"error": err.Error()}
-				return nil
-			}
-			list := make([]map[string]any, 0, len(missions))
-			for _, m := range missions {
-				list = append(list, map[string]any{
-					"title":  m.Title,
-					"degree": m.Degree,
-					"bonus":  m.Bonus,
-					"done":   m.IsFinish == 1,
-				})
-			}
-			out = map[string]any{"tasks": list}
-			return nil
-		}) {
-			writeJSON(w, map[string]any{
-				"error": "有任务正在执行，账号上下文被占用，请稍后再点「任务」",
-				"busy":  true,
-			})
+			writeJSON(w, map[string]any{"beans": n, "username": sess.Username})
 			return
 		}
-		writeJSON(w, out)
+
+		missions, err := huawei.TasksByStar(sess, 1, 2, 3, 4, 5)
+		if err != nil {
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+		list := make([]map[string]any, 0, len(missions))
+		for _, m := range missions {
+			list = append(list, map[string]any{
+				"title":  m.Title,
+				"degree": m.Degree,
+				"bonus":  m.Bonus,
+				"done":   m.IsFinish == 1,
+			})
+		}
+		writeJSON(w, map[string]any{"tasks": list})
 		return
 	}
 

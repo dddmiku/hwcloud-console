@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -47,6 +48,63 @@ type Mission struct {
 type missionResponse struct {
 	Total int       `json:"total"`
 	List  []Mission `json:"QueryMissionDtoList"`
+}
+
+// NewForAccount 构造一个**不依赖全局 accountID** 的会话。
+//
+// 为什么需要这个：config.SetAccount 是进程级全局变量，CookieFile()
+// 和 UserAgent() 都从它推导路径。所以任何读写会话的代码都必须先拿
+// 全局锁 s.mu，把 accountID 切到目标账号 —— 而全局锁会被周常/保活
+// 这类长任务持有 5-10 分钟。
+//
+// 结果是：点「任务」「积分」这种 1 秒就能返回的纯 HTTP 查询，
+// 要排队等 10 分钟，最后还可能撞上前端超时。用户看到的是
+// 「有任务正在执行，账号上下文被占用」。
+//
+// 这个构造函数直接接收账号目录，把 cookie 和 UA 的读取路径固定下来，
+// 不碰任何全局状态，因此可以并发调用、完全不需要锁。
+//
+// dir 是账号的 state 目录（如 /opt/hwcloud-demo/accounts/<phone>/state）。
+func NewForAccount(dir string) (*Session, error) {
+	cookieFile := filepath.Join(dir, "cookies.json")
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{
+		Proxy:             ieproxy.GetProxyFunc(),
+		ForceAttemptHTTP2: false,
+	}
+	s := &Session{
+		client:     &http.Client{Jar: jar, Timeout: 20 * time.Second, Transport: transport},
+		jar:        jar,
+		UA:         userAgentIn(dir),
+		CookieFile: cookieFile,
+	}
+	if err := s.loadCookies(cookieFile); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// userAgentIn 读指定账号目录下 meta.json 里的 UA。
+//
+// 必须是这个而不是 config.UserAgent()：后者读全局 accountID 指向的目录，
+// 并发时会拿到别的账号的 UA。华为云 WAF 按 UA 指纹校验，
+// UA 不匹配直接回 404，伪装成「会话失效」—— 排查成本极高。
+func userAgentIn(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		return config.DefaultUA
+	}
+	var meta map[string]any
+	if json.Unmarshal(data, &meta) != nil {
+		return config.DefaultUA
+	}
+	if ua, ok := meta["user_agent"].(string); ok && ua != "" {
+		return ua
+	}
+	return config.DefaultUA
 }
 
 func New(cookieFile string) (*Session, error) {
