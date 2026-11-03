@@ -290,63 +290,34 @@ func RunEventTask(opts EventOptions) (map[string]any, error) {
 	}`)
 	page.WaitForTimeout(2000)
 
-	// 找第一个「立即报名」按钮。
+	// 找并点击第一个「立即报名」。
 	//
-	// 【不能用 querySelectorAll('*') 遍历所有元素】
+	// 【用 Locator 而不是自己算坐标】
 	//
-	// 那样找到的往往是包着按钮的外层 div（innerText 同样是「立即报名」），
-	// 它的中心点可能落在图片或留白上，点下去毫无反应 ——
-	// 实测就表现为「点『立即报名』后 20 秒内没打开报名页」。
+	// 探测确认（2026-11-03）：赛事列表页的「立即报名」是
+	// <button class="tiny-button">，点击后**会**在新标签打开
+	// /competition/raceEnrollment/<id>，新页有完整报名表单。
 	//
-	// 现在只找真正的可点元素（button/a/[role=button]/带 pointer 光标的），
-	// 并且取**面积最小**的那个 —— 越小的元素越可能是按钮本体，
-	// 而不是把整个卡片包住的外层容器。
-	pos, err := page.Evaluate(`() => {
-		const cands = [];
-		document.querySelectorAll('button, a, [role=button], div, span').forEach(el => {
-			const t = (el.innerText || '').trim();
-			if (t !== '立即报名') return;
-			const r = el.getBoundingClientRect();
-			if (r.width < 40 || r.height < 20) return;
-			if (r.y < 0 || r.y > window.innerHeight) return;   // 必须在视口内
-			const cs = getComputedStyle(el);
-			if (cs.visibility === 'hidden' || cs.display === 'none') return;
-			cands.push({x: Math.round(r.x + r.width/2),
-			            y: Math.round(r.y + r.height/2),
-			            area: Math.round(r.width * r.height),
-			            tag: el.tagName,
-			            w: Math.round(r.width), h: Math.round(r.height)});
-		});
-		if (!cands.length) return null;
-		cands.sort((a, b) => a.area - b.area);
-		return cands[0];
-	}`)
-	if err != nil {
-		return nil, err
-	}
-	m, _ := pos.(map[string]any)
-	if m == nil {
+	// 之前失败是因为自己算坐标 + 鼠标点击：按钮在视口外（y>1000）
+	// 或滚动后位置变了，点下去落在别处，新标签页永远不出现。
+	//
+	// Locator.Click 会自己滚动到元素、等它可交互、再点，
+	// 不用管视口和滚动偏移，这是官方推荐做法。
+	btn := page.Locator(`button:has-text("立即报名")`).First()
+	if n, _ := page.Locator(`button:has-text("立即报名")`).Count(); n == 0 {
 		return map[string]any{"ok": true, "msg": "没有可报名的赛事（页面上找不到「立即报名」）"}, nil
 	}
-	fmt.Printf("[*] 点击「立即报名」@(%v,%v) tag=%v %vx%v\n",
-		m["x"], m["y"], m["tag"], m["w"], m["h"])
-
-	// 先用真实鼠标点，失败再退回 DOM click。
-	//
-	// 两种方式各有盲区：鼠标点击依赖坐标命中（元素可能被遮挡），
-	// DOM click 对某些自定义组件不触发跳转。都试一遍最稳。
-	clicked := false
-	if err := page.Mouse().Click(toFloat(m["x"]), toFloat(m["y"])); err == nil {
-		clicked = true
+	if err := btn.ScrollIntoViewIfNeeded(); err != nil {
+		// 滚不到就继续试点击，不致命
 	}
-	if !clicked {
-		page.Evaluate(`() => {
-			const el = Array.from(document.querySelectorAll('button,a,[role=button]'))
-				.find(x => (x.innerText||'').trim() === '立即报名');
-			if (el) el.click();
-		}`)
+	page.WaitForTimeout(500)
+	if err := btn.Click(playwright.LocatorClickOptions{
+		Timeout: playwright.Float(15000),
+	}); err != nil {
+		return nil, fmt.Errorf("点击「立即报名」失败: %w", err)
 	}
-	page.WaitForTimeout(9000)
+	fmt.Println("[*] 已点击「立即报名」")
+	page.WaitForTimeout(6000)
 
 	// 点击「立即报名」会**打开新标签页**跳到 raceEnrollment/<id>，
 	// 原页面不动。早先的代码继续用原来的 page，于是：
@@ -447,11 +418,11 @@ func RunEventTask(opts EventOptions) (map[string]any, error) {
 	}
 
 	// 3. 提交报名
-	btn := page.Locator(`button:has-text("报名")`)
-	if count(btn) == 0 {
+	submitBtn := page.Locator(`button:has-text("报名")`)
+	if count(submitBtn) == 0 {
 		return nil, fmt.Errorf("找不到报名按钮")
 	}
-	if err := btn.Last().Click(); err != nil {
+	if err := submitBtn.Last().Click(); err != nil {
 		return nil, err
 	}
 	page.WaitForTimeout(8000)
