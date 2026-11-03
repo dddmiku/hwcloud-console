@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1381,11 +1382,104 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	// 早先这里是 withAccountTry：拿不到锁就报「账号上下文被占用」。
 	// 那只是把「排队 10 分钟」换成了「直接失败」，用户还是查不了。
 	// 现在真正绕开锁，任何时候点都能秒回。
-	if name == "tasks" || name == "beans" || name == "session" {
+	if name == "tasks" || name == "beans" || name == "session" ||
+		name == "harmony-tasks" || name == "harmony-star" || name == "harmony-daily" ||
+		name == "harmony-bind" || name == "harmony-star-run" || name == "labs" {
 		stateDir := filepath.Join(config.Root(), "accounts", id, "state")
 		sess, err := huawei.NewForAccount(stateDir)
 		if err != nil {
 			writeJSON(w, map[string]any{"error": "读取会话失败: " + err.Error()})
+			return
+		}
+
+		// 鸿蒙实践中心的三个任务都是纯协议、只碰 harmonybp 域，
+		// 和华为云成长中心那套状态互不干扰，所以同样走无锁分支 ——
+		// 否则一个 2 分钟的 dwell 计时会把整个面板的查询堵住。
+		switch name {
+		case "harmony-tasks":
+			list, err := task.HarmonyTasks(sess)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			out := make([]map[string]any, 0, len(list))
+			for _, t := range list {
+				out = append(out, map[string]any{
+					"task_key": t.TaskKey,
+					"name":     t.Name,
+					"points":   t.Points,
+					"status":   t.Status,
+					"done":     t.Done,
+				})
+			}
+			writeJSON(w, map[string]any{"tasks": out})
+			return
+
+		case "harmony-star":
+			// 只读：查 GitCode 绑定 + Star 任务状态
+			res, err := task.HarmonyStarStatus(sess)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, res)
+			return
+
+		case "harmony-star-run":
+			// 执行 Star：挑仓库 → POST /api/v2/projects/<id>/star → 触发华为云核验
+			res, err := task.RunHarmonyStar(sess, stateDir)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, res)
+			return
+
+		case "harmony-daily":
+			res, err := task.RunHarmonyDwell(sess, 120)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, res)
+			return
+
+		case "harmony-bind":
+			// 绑定 GitCode 到鸿蒙实践中心（GitCode Star 任务的前置条件）。
+			// 需要 GitCode 会话 + 有头浏览器，详见 internal/task/harmony_bind.go。
+			res, err := task.HarmonyBindGitCode(sess, stateDir, false)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, res)
+			return
+
+		case "labs":
+			// 只读：列出有剩余免费名额的实验
+			labs, err := task.ListLabs(false, filepath.Join(config.Root(), "accounts", id, "state", "cookies.json"), 12)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			free := make([]map[string]any, 0, 64)
+			for _, l := range labs {
+				if l.FreeNum <= 0 {
+					continue
+				}
+				free = append(free, map[string]any{
+					"id":      l.ID,
+					"title":   l.Title,
+					"free":    l.FreeNum,
+					"price":   l.Price,
+					"level":   l.Level,
+					"minutes": l.Times / 60,
+				})
+			}
+			sort.Slice(free, func(i, j int) bool {
+				return free[i]["minutes"].(int) < free[j]["minutes"].(int)
+			})
+			writeJSON(w, map[string]any{"total": len(labs), "free": len(free), "labs": free})
 			return
 		}
 
@@ -1453,21 +1547,35 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 
 		case "lab":
 			// 跑云实验：读 data/lab_record.txt 作为过程记录。
-			// 实验要开真实环境、跑几分钟，这里给足超时。
+			//
+			// 自动挑实验：先查当天还有免费名额的实验，挑时长最短的那个。
+			// 原来固定跑 2325，名额用完时点「开始实验」不报错但会卡住或扣点，
+			// 表现成「每周实践一个实验」一直不完成。
 			rec, err := os.ReadFile(filepath.Join(config.DataDir(), "lab_record.txt"))
 			if err != nil {
 				return map[string]any{"error": "缺少实验过程记录 data/lab_record.txt"}
 			}
+
+			labID := config.DefaultLabID
+			picked := ""
+			if lab, perr := task.PickFreeLab(false, config.CookieFile(), config.DefaultLabID); perr == nil {
+				labID = lab.ID
+				picked = fmt.Sprintf("%s（id=%d，剩余名额 %d）", lab.Title, lab.ID, lab.FreeNum)
+			} else {
+				svcLog("[lab] 自动挑选实验失败，回退到默认 %d: %v", labID, perr)
+			}
+
 			res, err := task.RunLabTask(task.LabOptions{
-				LabID:      config.DefaultLabID,
+				LabID:      labID,
 				RecordText: strings.TrimSpace(string(rec)),
 				Headless:   true,
 				End:        true,
 				Timeout:    600,
 			})
 			if err != nil {
-				return map[string]any{"error": err.Error()}
+				return map[string]any{"error": err.Error(), "lab_id": labID, "picked": picked}
 			}
+			res["picked"] = picked
 			return res
 
 		case "blog":
@@ -2961,7 +3069,7 @@ func (s *Server) runDaily() map[string]any {
 	}
 
 	// 3. 发文章
-	svcLog("[daily] 步骤3/3 发文章…")
+	svcLog("[daily] 步骤3/5 发文章…")
 	if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "blog_post.md")); err != nil {
 		svcLog("[daily] 发文章缺少 blog_post.md")
 		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "缺少 data/blog_post.md"})
@@ -2973,6 +3081,47 @@ func (s *Server) runDaily() map[string]any {
 	} else {
 		svcLog("[daily] 发文章成功: %v", res["url"])
 		steps = append(steps, map[string]any{"name": "发文章", "ok": true, "msg": "已发布", "detail": res})
+	}
+
+	// 4/5. 鸿蒙实践中心的每日任务（纯协议，各约 30 秒 / 几秒）
+	//
+	// 这两个是独立的成长中心（harmonybp.developer.huaweicloud.com），
+	// 和上面三个任务不共享状态，失败不影响其它步骤。
+	//
+	// 注意 dwell 要真的耗 30 秒（服务端按心跳累积计时），
+	// 所以放在最后，避免拖慢前面的签到/文章。
+	stateDir := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
+
+	svcLog("[daily] 步骤4/5 鸿蒙每日浏览案例…")
+	if sess, err := huawei.NewForAccount(stateDir); err != nil {
+		svcLog("[daily] 鸿蒙浏览失败（建会话）: %v", err)
+		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
+	} else if res, err := task.RunHarmonyDwell(sess, 120); err != nil {
+		svcLog("[daily] 鸿蒙浏览失败: %v", err)
+		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
+	} else if done, _ := res["done"].(bool); done || res["already"] == true {
+		svcLog("[daily] 鸿蒙浏览完成")
+		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": true, "msg": "+10", "detail": res})
+	} else {
+		msg, _ := res["msg"].(string)
+		svcLog("[daily] 鸿蒙浏览未完成: %s", msg)
+		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": msg})
+	}
+
+	svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓…")
+	if sess, err := huawei.NewForAccount(stateDir); err != nil {
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
+	} else if res, err := task.RunHarmonyStar(sess, stateDir); err != nil {
+		svcLog("[daily] 鸿蒙Star失败: %v", err)
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
+	} else if done, _ := res["completed"].(bool); done || res["already"] == true {
+		svcLog("[daily] 鸿蒙Star完成")
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": true, "msg": "+30", "detail": res})
+	} else if need, _ := res["need_binding"].(bool); need {
+		svcLog("[daily] 鸿蒙Star需要先绑定 GitCode")
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "需要先绑定 GitCode"})
+	} else {
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "核验未通过", "detail": res})
 	}
 
 	svcLog("[daily] 结束，总耗时 %s", time.Since(dStart).Round(time.Second))
@@ -3027,18 +3176,37 @@ func (s *Server) runWeekly() map[string]any {
 	if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "lab_record.txt")); err != nil {
 		svcLog("[weekly] 云实验缺少 lab_record.txt")
 		steps = append(steps, map[string]any{"name": "云实验", "ok": false, "msg": "缺少 data/lab_record.txt"})
-	} else if res, err := task.RunLabTask(task.LabOptions{
-		LabID:      config.DefaultLabID,
-		RecordText: strings.TrimSpace(string(raw)),
-		Headless:   true,
-		End:        true,
-		Timeout:    600,
-	}); err != nil {
-		svcLog("[weekly] 云实验失败: %v", err)
-		steps = append(steps, map[string]any{"name": "云实验", "ok": false, "msg": err.Error()})
 	} else {
-		svcLog("[weekly] 云实验完成: %v", res)
-		steps = append(steps, map[string]any{"name": "云实验", "ok": true, "msg": "已完成", "detail": res})
+		// 自动挑一个当天还有免费名额、时长最短的实验。
+		// 固定跑 2325 的问题：名额用完时点「开始实验」不报错但会卡住，
+		// 表现成「每周实践一个实验」一直不完成，还白占一次配额。
+		labID := config.DefaultLabID
+		picked := ""
+		if lab, perr := task.PickFreeLab(false, config.CookieFile(), config.DefaultLabID); perr == nil {
+			labID = lab.ID
+			picked = fmt.Sprintf("%s（id=%d，%d分钟，名额%d）",
+				lab.Title, lab.ID, lab.Times/60, lab.FreeNum)
+			svcLog("[weekly] 自动选中实验: %s", picked)
+		} else {
+			svcLog("[weekly] 自动挑实验失败，回退 %d: %v", labID, perr)
+		}
+
+		if res, err := task.RunLabTask(task.LabOptions{
+			LabID:      labID,
+			RecordText: strings.TrimSpace(string(raw)),
+			Headless:   true,
+			End:        true,
+			Timeout:    600,
+		}); err != nil {
+			svcLog("[weekly] 云实验失败: %v", err)
+			steps = append(steps, map[string]any{"name": "云实验", "ok": false,
+				"msg": err.Error(), "picked": picked})
+		} else {
+			svcLog("[weekly] 云实验完成: %v", res)
+			res["picked"] = picked
+			steps = append(steps, map[string]any{"name": "云实验", "ok": true,
+				"msg": "已完成：" + picked, "detail": res})
+		}
 	}
 
 issueStep:
@@ -3158,6 +3326,31 @@ issueStep:
 		} else {
 			svcLog("[weekly] 开发者赛事完成: 报名=%v 作品=%v", res["signed_up"], res["uploaded"])
 			steps = append(steps, map[string]any{"name": "开发者赛事", "ok": true, "msg": "已报名并提交作品", "detail": res})
+		}
+	}
+
+	// 7. 鸿蒙实践中心：云端实践（每周 +100）
+	//
+	// 这条走不了纯协议 —— external_report 类型，submit 直接 403
+	// browser_submit_not_allowed，必须在 DevSpace 环境里真跑一次。
+	// 这里只查状态并提示，不硬跑，避免白占一次实验配额。
+	stateDirW := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
+	svcLog("[weekly] 步骤6/6 鸿蒙云端实践：查询状态…")
+	if sessW, err := huawei.NewForAccount(stateDirW); err == nil {
+		if list, err := task.HarmonyTasks(sessW); err == nil {
+			for _, t := range list {
+				if t.TaskKey != "cloud-practice" {
+					continue
+				}
+				if t.Done {
+					svcLog("[weekly] 鸿蒙云端实践本周已完成")
+					steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": true, "msg": "本周已完成"})
+				} else {
+					svcLog("[weekly] 鸿蒙云端实践未完成（需 DevSpace 环境 + 实名主账号，无法纯协议）")
+					steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": false,
+						"msg": "需要 DevSpace 环境，暂无法自动化"})
+				}
+			}
 		}
 	}
 

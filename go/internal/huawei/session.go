@@ -233,6 +233,40 @@ func (s *Session) HTTPClient() *http.Client {
 	return s.client
 }
 
+// CookieHeader 把 jar 里的 Cookie 拼成请求头，供跨域接口（如鸿蒙实践中心）复用。
+//
+// 为什么需要它：jar 只在发往对应域时才吐 Cookie，而鸿蒙实践中心
+// （harmonybp.developer.huaweicloud.com）不在 grow 那套 URL 里，
+// 直接拿 s.client 发请求是带不上 Cookie 的 —— 必须手动拼头。
+//
+// 只取 huaweicloud.com 及其子域的 Cookie：其它域（gitcode 等）的
+// Cookie 混进去会污染请求。
+func (s *Session) CookieHeader() string {
+	if s.jar == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, host := range []string{
+		"https://developer.huaweicloud.com/",
+		"https://harmonybp.developer.huaweicloud.com/",
+		"https://edu.huaweicloud.com/",
+	} {
+		u, err := url.Parse(host)
+		if err != nil {
+			continue
+		}
+		for _, c := range s.jar.Cookies(u) {
+			if b.Len() > 0 {
+				b.WriteString("; ")
+			}
+			b.WriteString(c.Name)
+			b.WriteByte('=')
+			b.WriteString(c.Value)
+		}
+	}
+	return b.String()
+}
+
 func (s *Session) setCommonHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", s.UA)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -470,4 +504,4 @@ func truncate(data []byte) string {
 		return string(data[:200])
 	}
 	return string(data)
-}
+}

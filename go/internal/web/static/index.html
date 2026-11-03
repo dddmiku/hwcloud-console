@@ -57,6 +57,19 @@
   </div>
 
   <div class="card">
+    <h2>
+      可用实验
+      <span class="badge" id="labCount">—</span>
+      <span class="spacer"></span>
+      <button class="btn sm" data-call="loadLabs">查询</button>
+    </h2>
+    <div class="sub" style="margin-bottom:10px">
+      按剩余免费名额和时长排序。跑「云实验」时会自动挑最短的那个。
+    </div>
+    <div id="labBox"><div class="hint">点「查询」加载当天的实验名额</div></div>
+  </div>
+
+  <div class="card">
     <h2>日志</h2>
     <div class="tabs">
       <button class="tab active" data-log="service.log" data-call="loadLogTab">service</button>

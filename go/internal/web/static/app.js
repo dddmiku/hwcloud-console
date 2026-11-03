@@ -496,24 +496,37 @@ function renderAccount(a){
     '<div class="acc-body">' +
       items.map(([k,v]) => '<div class="item"><span class="k">'+k+'</span><span>'+v+'</span></div>').join('') +
     '</div>' +
+    // 按钮分三组：日常 / 周常 / 工具。
+    // 之前十几个按钮平铺一行，用户找不到哪个是「每天要做」的。
     '<div class="acc-actions">' +
-      act('run', 'daily', '一键日常', 'primary') +
-      act('run', 'weekly', '一键周常', 'primary') +
-      act('run', 'sign', '签到') +
-      act('run', 'devspace', 'DevSpace') +
-      act('run', 'lab', '实验') +
-      act('run', 'blog', '发文章') +
-      act('run', 'issue', '提Issue') +
-      act('run', 'star', 'Star') +
-      act('run', 'eventjoin', '活动报名') +
-      gitcodeBtn(a) +
-      act('run', 'keepalive', '保活') +
-      act('relogin', '', '重新登录') +
-      act('beans', '', '积分') +
-      act('check', '', '检查') +
-      act('tasks', '', '任务') +
-      '<span class="spacer"></span>' +
-      act('remove', '', '删除', 'danger') +
+      '<div class="act-group">' +
+        '<span class="act-label">日常</span>' +
+        act('run', 'daily', '一键日常', 'primary') +
+        act('run', 'sign', '签到') +
+        act('run', 'devspace', 'DevSpace') +
+        act('run', 'blog', '发文章') +
+        act('run', 'harmony-daily', '鸿蒙浏览') +
+        act('run', 'harmony-star-run', '鸿蒙Star') +
+      '</div>' +
+      '<div class="act-group">' +
+        '<span class="act-label">周常</span>' +
+        act('run', 'weekly', '一键周常', 'primary') +
+        act('run', 'lab', '云实验') +
+        act('run', 'issue', '提Issue') +
+        act('run', 'star', 'Star仓库') +
+        act('run', 'eventjoin', '活动报名') +
+      '</div>' +
+      '<div class="act-group">' +
+        '<span class="act-label">工具</span>' +
+        gitcodeBtn(a) +
+        act('run', 'harmony-bind', '鸿蒙绑定') +
+        act('run', 'keepalive', '保活') +
+        act('relogin', '', '重新登录') +
+        act('beans', '', '积分') +
+        act('check', '', '检查') +
+        act('tasks', '', '任务') +
+        act('remove', '', '删除', 'danger') +
+      '</div>' +
     '</div>' +
   '</div>';
 }
@@ -531,6 +544,7 @@ const DATA_CALL = {
   doAdd, closeAdd, doLogin, doTrust, closeLogin,
   hideVnc, copyVncTunnel, copyVncPass,
   probeBindState,
+  loadLabs,
   loadLogRefresh: () => loadLog(currentLog),
   loadLogTab: (el) => {
     const name = el.dataset.log;
@@ -1696,6 +1710,55 @@ async function loadTimers(){
   }catch(e){
     $('timerBox').innerHTML = '<div class="hint err">' + esc(e.message) + '</div>';
   }
+}
+
+// loadLabs 列出当天还有免费名额的云实验。
+//
+// 为什么要单独一个面板：跑「云实验」时程序会自动挑一个还有名额的实验，
+// 但用户看不到到底有多少可选、要花多久。这里把候选列出来，
+// 让「每周实践一个实验」这件事不再是黑盒。
+async function loadLabs(){
+  const box = $('labBox');
+  if(!box) return;
+  box.innerHTML = '<div class="hint">查询中…（要开一次浏览器取 token，约 15 秒）</div>';
+  try{
+    // 实验列表接口需要 auth-token，它只在浏览器 sessionStorage 里，
+    // 所以后端会先开一次浏览器把 token 读出来，再走纯 HTTP 翻页。
+    const d = await api('/api/accounts/run?id=' + encodeURIComponent(firstAccountID()) +
+                        '&name=labs', {method:'POST'});
+    if(d.error){
+      box.innerHTML = '<div class="hint err">' + esc(d.error) + '</div>';
+      return;
+    }
+    const list = d.labs || [];
+    $('labCount').textContent = (d.free || 0) + ' / ' + (d.total || 0);
+    if(!list.length){
+      box.innerHTML = '<div class="hint">当前没有剩余免费名额的实验</div>';
+      return;
+    }
+    const rows = list.slice(0, 30).map(l =>
+      '<div class="row">' +
+        '<span class="k" style="flex:0 0 auto">' +
+          '<span class="badge">' + esc(l.minutes) + ' 分钟</span> ' +
+          esc(l.title) +
+        '</span>' +
+        '<span class="v" style="flex:0 0 auto;margin-left:auto">' +
+          '<span class="ok">名额 ' + esc(l.free) + '</span>' +
+          ' <span class="hint" style="display:inline">' + esc(l.price) + ' 实验点</span>' +
+        '</span>' +
+      '</div>').join('');
+    box.innerHTML = rows +
+      (list.length > 30 ? '<div class="hint">还有 ' + (list.length - 30) + ' 个未显示</div>' : '');
+  }catch(e){
+    box.innerHTML = '<div class="hint err">' + esc(e.message) + '</div>';
+  }
+}
+
+// firstAccountID 取列表里第一个账号的 id（实验列表接口与账号无关，
+// 只是需要一个有效会话去换 token）。
+function firstAccountID(){
+  const el = document.querySelector('.acc');
+  return el ? el.dataset.id : '';
 }
 
 async function loadLog(name, btn){
