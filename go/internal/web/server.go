@@ -3120,6 +3120,16 @@ issueStep:
 		svcLog("[weekly] 开发者活动成功: %v", res["activity"])
 		steps = append(steps, map[string]any{"name": "开发者活动", "ok": true, "msg": "已报名", "detail": res})
 	} else {
+		// 把每张卡片的处理结局也打出来。
+		//
+		// 只打 result 时，「没有可报名的活动」这句话完全看不出是
+		// 「真的都报过了」还是「页面没识别出来」—— 排查时只能靠猜。
+		// traces 里有每张卡片的 skip 原因，一眼就能定位。
+		if tr, ok := res["traces"].([]map[string]any); ok && len(tr) > 0 {
+			for _, t := range tr {
+				svcLog("[weekly]   卡片%v: %v", t["idx"], t["skip"])
+			}
+		}
 		svcLog("[weekly] 开发者活动未完成: %v", res["result"])
 		steps = append(steps, map[string]any{"name": "开发者活动", "ok": false, "msg": fmt.Sprint(res["result"])})
 	}

@@ -377,20 +377,28 @@ func joinEventInner(dryRun bool) (map[string]any, error) {
 					        && x.getBoundingClientRect().width > 30);
 				if (b) b.click();
 			}`)
-			// 等表单元素出现，最多 12 秒。
+
+			// 等整页跳转到 /signupInfo/<id>/activity。
 			//
-			// 不能等太久：这个循环跑 3 张卡片，每张多等 8 秒就是 24 秒，
-			// 加上新标签页等待（最多 10 秒）和详情页渲染（4 秒），
-			// 很容易顶到 4 分钟看门狗。
+			// 点「立即报名」不是弹窗，是**导航**。导航期间
+			// Locator().Count() 会返回 0（旧文档已卸载、新文档还没就绪），
+			// 所以必须先用 WaitForLoadState 等导航结束，再等表单元素。
+			_ = detail.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+				State: playwright.LoadStateDomcontentloaded,
+			})
+			detail.WaitForTimeout(3000)
+
+			// 再轮询等表单元素渲染出来（最多 12 秒）
 			for i := 0; i < 12; i++ {
-				detail.WaitForTimeout(1000)
 				cnt, _ := detail.Locator(
 					`input[placeholder*="学校"], input[placeholder*="公司"], .select-box`).Count()
 				if cnt > 0 {
 					break
 				}
+				detail.WaitForTimeout(1000)
 			}
 			detail.WaitForTimeout(1200)
+			trace["after_expand"] = detail.URL()
 		}
 
 		// 填表。
@@ -484,30 +492,79 @@ func joinEventInner(dryRun bool) (map[string]any, error) {
 		}
 
 		// 提交
-		detail.Evaluate(`() => {
+		subClicked, _ := detail.Evaluate(`() => {
 			const b = Array.from(document.querySelectorAll('button,a'))
 				.find(x => (x.innerText||'').trim() === '报名'
 				        && x.getBoundingClientRect().width > 30);
-			if (b) b.click();
+			if (b) { b.click(); return true; }
+			return false;
 		}`)
+		if ok, _ := subClicked.(bool); !ok {
+			trace["skip"] = "找不到「报名」提交按钮"
+			if detail != page {
+				detail.Close()
+			}
+			continue
+		}
 		detail.WaitForTimeout(8000)
 
-		after, _ := detail.Evaluate(`() => {
+		// 判断提交结果。
+		//
+		// 三个信号任意一个成立就算成功：
+		//   1. 出现「已报名」按钮（精确匹配）
+		//   2. 页面正文出现「报名成功」
+		//   3. 「报名」按钮消失了（说明状态变了）
+		// 只看第 1 个太脆弱 —— 不同活动的按钮文案不统一，
+		// 有的成功后直接整块隐藏。
+		after, evalErr := detail.Evaluate(`() => {
 			const btns = Array.from(document.querySelectorAll('button,a'))
 				.map(b => (b.innerText || '').trim());
+			const body = document.body.innerText || '';
 			const errs = Array.from(document.querySelectorAll('*'))
 				.filter(x => /请(输入|选择)/.test(x.innerText||'')
-				        && (x.innerText||'').length < 40);
-			return {ok: btns.includes('已报名'), err: errs.length ? errs[0].innerText.trim() : ''};
+				        && (x.innerText||'').length < 40)
+				.map(x => x.innerText.trim());
+			return {
+				already: btns.includes('已报名'),
+				success: body.includes('报名成功'),
+				noSignupBtn: !btns.includes('报名') && !btns.includes('立即报名'),
+				errs: errs.slice(0, 3),
+				url: location.href
+			};
 		}`)
-		am, _ := after.(map[string]any)
-		if am != nil && am["ok"] == true {
-			out["ok"] = true
-			out["result"] = "已报名"
-			return out, nil
+		if evalErr != nil {
+			trace["skip"] = "提交后读取页面失败: " + evalErr.Error()
+			if detail != page {
+				detail.Close()
+			}
+			continue
 		}
+		am, _ := after.(map[string]any)
 		if am != nil {
-			out["last_error"], _ = am["err"].(string)
+			trace["after_submit"] = am
+			if am["already"] == true || am["success"] == true {
+				out["ok"] = true
+				out["result"] = "已报名"
+				out["activity"] = actID
+				return out, nil
+			}
+			// 「报名」按钮消失也算成功（部分活动成功后整块隐藏）
+			if am["noSignupBtn"] == true {
+				out["ok"] = true
+				out["result"] = "已报名（按钮已消失）"
+				out["activity"] = actID
+				return out, nil
+			}
+			if es, ok := am["errs"].([]any); ok && len(es) > 0 {
+				var parts []string
+				for _, e := range es {
+					parts = append(parts, fmt.Sprint(e))
+				}
+				out["last_error"] = strings.Join(parts, "; ")
+				trace["skip"] = "表单校验未过: " + strings.Join(parts, "; ")
+			} else {
+				trace["skip"] = "提交后状态未变化"
+			}
 		}
 
 		if detail != page {

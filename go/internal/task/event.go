@@ -276,27 +276,75 @@ func RunEventTask(opts EventOptions) (map[string]any, error) {
 	}
 	page.WaitForTimeout(10000)
 
-	// 找第一个「立即报名」
+	// 先把页面滚一遍触发懒渲染。
+	//
+	// 赛事列表和活动列表一样是懒加载的：卡片在 DOM 里但
+	// getBoundingClientRect() 全是 0，不滚一遍就找不到可点的元素。
+	page.Evaluate(`async () => {
+		const step = window.innerHeight * 0.8;
+		for (let y = 0; y < document.body.scrollHeight; y += step) {
+			window.scrollTo(0, y);
+			await new Promise(r => setTimeout(r, 120));
+		}
+		window.scrollTo(0, 0);
+	}`)
+	page.WaitForTimeout(2000)
+
+	// 找第一个「立即报名」按钮。
+	//
+	// 【不能用 querySelectorAll('*') 遍历所有元素】
+	//
+	// 那样找到的往往是包着按钮的外层 div（innerText 同样是「立即报名」），
+	// 它的中心点可能落在图片或留白上，点下去毫无反应 ——
+	// 实测就表现为「点『立即报名』后 20 秒内没打开报名页」。
+	//
+	// 现在只找真正的可点元素（button/a/[role=button]/带 pointer 光标的），
+	// 并且取**面积最小**的那个 —— 越小的元素越可能是按钮本体，
+	// 而不是把整个卡片包住的外层容器。
 	pos, err := page.Evaluate(`() => {
-		const hits = [];
-		document.querySelectorAll('*').forEach(el => {
+		const cands = [];
+		document.querySelectorAll('button, a, [role=button], div, span').forEach(el => {
 			const t = (el.innerText || '').trim();
 			if (t !== '立即报名') return;
 			const r = el.getBoundingClientRect();
-			if (r.width < 60 || r.height < 25 || r.y < 600) return;
-			hits.push({x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)});
+			if (r.width < 40 || r.height < 20) return;
+			if (r.y < 0 || r.y > window.innerHeight) return;   // 必须在视口内
+			const cs = getComputedStyle(el);
+			if (cs.visibility === 'hidden' || cs.display === 'none') return;
+			cands.push({x: Math.round(r.x + r.width/2),
+			            y: Math.round(r.y + r.height/2),
+			            area: Math.round(r.width * r.height),
+			            tag: el.tagName,
+			            w: Math.round(r.width), h: Math.round(r.height)});
 		});
-		return hits[0] || null;
+		if (!cands.length) return null;
+		cands.sort((a, b) => a.area - b.area);
+		return cands[0];
 	}`)
 	if err != nil {
 		return nil, err
 	}
 	m, _ := pos.(map[string]any)
 	if m == nil {
-		return map[string]any{"ok": true, "msg": "没有可报名的赛事"}, nil
+		return map[string]any{"ok": true, "msg": "没有可报名的赛事（页面上找不到「立即报名」）"}, nil
 	}
-	if err := page.Mouse().Click(toFloat(m["x"]), toFloat(m["y"])); err != nil {
-		return nil, err
+	fmt.Printf("[*] 点击「立即报名」@(%v,%v) tag=%v %vx%v\n",
+		m["x"], m["y"], m["tag"], m["w"], m["h"])
+
+	// 先用真实鼠标点，失败再退回 DOM click。
+	//
+	// 两种方式各有盲区：鼠标点击依赖坐标命中（元素可能被遮挡），
+	// DOM click 对某些自定义组件不触发跳转。都试一遍最稳。
+	clicked := false
+	if err := page.Mouse().Click(toFloat(m["x"]), toFloat(m["y"])); err == nil {
+		clicked = true
+	}
+	if !clicked {
+		page.Evaluate(`() => {
+			const el = Array.from(document.querySelectorAll('button,a,[role=button]'))
+				.find(x => (x.innerText||'').trim() === '立即报名');
+			if (el) el.click();
+		}`)
 	}
 	page.WaitForTimeout(9000)
 
