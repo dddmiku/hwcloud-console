@@ -28,6 +28,23 @@ type Account struct {
 	// 纯展示用，不参与任何业务逻辑。
 	Remark string `json:"remark,omitempty"`
 
+	// AutoKeepAlive 控制是否允许自动账密登录（保活）。
+	//
+	// 为什么需要这个开关：
+	//   开了双重验证（MFA）的账号，自动登录走到发短信那一步就卡住了 ——
+	//   服务端确实把短信发出去了，但没人填验证码，会话永远建不起来。
+	//   于是每次保活都重新触发一次发短信，用户手机上被反复轰炸，
+	//   而且他自己完全不知道是后台在发（面板上只显示「自动登录失败」）。
+	//
+	// 关掉之后，保活只做纯协议续期（refresh token），
+	// 不会再拉起浏览器、不会发短信。会话真过期了就老老实实标记
+	// 「需要人工登录」，等用户自己点「重新登录」。
+	//
+	// 用指针是为了区分「没设置过」和「显式关掉」：
+	// 老账号的 account.json 里没有这个字段，读出来是 nil，
+	// 按默认值 true 处理（保持原有行为不变）。
+	AutoKeepAlive *bool `json:"auto_keep_alive,omitempty"`
+
 	// 设备信任相关
 	HwidCasSid string `json:"hwid_cas_sid,omitempty"`
 	Trusted    bool   `json:"trusted"`
@@ -363,6 +380,17 @@ func MaskPhone(p string) string {
 }
 
 // MaskedPhone 返回账号的脱敏手机号。
+// AutoKeepAliveOn 返回是否允许自动账密登录，默认 true。
+//
+// 字段是指针：老账号的 account.json 里没有这一项，读出来是 nil，
+// 这里按 true 处理，行为和加开关之前完全一致。
+func (a *Account) AutoKeepAliveOn() bool {
+	if a.AutoKeepAlive == nil {
+		return true
+	}
+	return *a.AutoKeepAlive
+}
+
 func (a *Account) MaskedPhone() string {
 	return MaskPhone(a.Phone)
 }

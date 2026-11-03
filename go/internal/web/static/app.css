@@ -229,6 +229,19 @@ a.btn{display:inline-flex;align-items:center;justify-content:center;text-decorat
 }
 .acc-remark.empty:hover{color:var(--accent);border-color:var(--accent)}
 
+/* 自动保活开关。做成一整块可点的文字，而不是 checkbox ——
+   卡片里的 .item 是「键 + 值」的表格布局，checkbox 会和文字对不齐。 */
+.keepalive-sw{
+  cursor:pointer;user-select:none;white-space:nowrap;
+  padding:1px 6px;border-radius:5px;
+  border:1px dashed transparent;
+}
+.keepalive-sw:hover{
+  border-color:var(--border);
+  background:rgba(120,140,180,.10);
+}
+.keepalive-sw .hint{font-size:11px;margin-left:2px}
+
 .remark-editor{
   display:flex;gap:8px;align-items:center;flex-wrap:wrap;
   padding:10px 12px;margin:0 0 8px;

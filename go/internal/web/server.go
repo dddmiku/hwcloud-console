@@ -203,6 +203,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/accounts/add", guard(s.handleAddAccount))
 	mux.HandleFunc("/api/accounts/remove", guard(s.handleRemoveAccount))
 	mux.HandleFunc("/api/accounts/remark", guard(s.handleAccountRemark))
+	mux.HandleFunc("/api/accounts/autokeepalive", guard(s.handleAccountAutoKeepAlive))
 	mux.HandleFunc("/api/accounts/check", guard(s.handleCheckAccount))
 	mux.HandleFunc("/api/accounts/login", guard(s.handleAccountLogin))
 	mux.HandleFunc("/api/accounts/captcha", guard(s.handleCaptcha))
@@ -441,6 +442,9 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			// 有没有存密码 —— 前端据此决定「重新登录」能不能点。
 			// 只回布尔值，绝不回密码本身。
 			"password_saved": a.Password != "",
+			// 是否允许自动保活（默认 true）。
+			// 开了双重验证的账号关掉它，否则每次保活都会发一条短信。
+			"auto_keep_alive": a.AutoKeepAliveOn(),
 			// 绑定状态：bound / unbound / error / mismatch / ""（未查询）
 			// 前端必须把 unbound 显眼地标出来 —— 没绑定时 Issue 白提
 			"gitcode_bind_state": a.GitCodeBindState,
@@ -795,6 +799,53 @@ func (s *Server) handleAccountRemark(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "remark": remark})
+}
+
+// handleAccountAutoKeepAlive 开关某个账号的自动保活。
+//
+// 请求：{"id":"账号ID","enabled":true|false}
+//
+// 关掉之后，保活只做纯协议续期，不会再拉起浏览器走账密登录。
+// 主要用于开了双重验证的账号：自动登录必然停在等短信，
+// 而每次重试都会重新发一条，用户手机上被反复轰炸却不知道来源。
+func (s *Server) handleAccountAutoKeepAlive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		ID      string `json:"id"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.ID == "" {
+		writeJSON(w, map[string]any{"error": "缺少 id"})
+		return
+	}
+	if _, ok := s.store.Get(req.ID); !ok {
+		writeJSON(w, map[string]any{"error": "账号不存在"})
+		return
+	}
+
+	on := req.Enabled
+	if err := s.store.Update(req.ID, func(a *account.Account) {
+		a.AutoKeepAlive = &on
+	}); err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	// 关掉的时候顺手清掉失败冷却，否则下次打开开关会被旧的冷却拦住
+	if !on {
+		s.loginFailMu.Lock()
+		delete(s.loginFailAt, req.ID)
+		s.loginFailMu.Unlock()
+	}
+	svcLog("[autokeepalive] %s 自动保活 -> %v", req.ID, on)
+	writeJSON(w, map[string]any{"ok": true, "auto_keep_alive": on})
 }
 
 // 从 map[string]any 里安全取值的小工具。
@@ -2687,6 +2738,18 @@ func (s *Server) autoLogin(id, reason string) (bool, string) {
 	}
 	if acc.Password == "" {
 		return false, "未保存密码，无法自动登录"
+	}
+	// 用户显式关掉了自动保活。
+	//
+	// 典型场景：开了双重验证的账号，自动登录走到发短信就卡住 ——
+	// 短信确实发出去了，但没人填，会话永远建不起来，于是每次保活
+	// 都重新发一次，手机上被反复轰炸，而用户不知道是后台在发。
+	//
+	// 关掉后保活只做纯协议续期，不再拉浏览器、不发短信。
+	// 这里用 false 而不是 error，让调用方走「会话不可用」的常规分支。
+	if !acc.AutoKeepAliveOn() {
+		svcLog("[autoLogin] %s 已关闭自动保活，跳过账密登录（原因：%s）", id, reason)
+		return false, "该账号已关闭自动保活，请手动点「重新登录」"
 	}
 
 	// 串行化：同一时刻只允许一个自动登录在跑

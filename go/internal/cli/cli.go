@@ -190,6 +190,15 @@ func cliAutoLogin() (bool, string) {
 	if acc.Password == "" {
 		return false, "未保存密码，无法自动登录"
 	}
+	// 用户关掉了自动保活就别再拉浏览器登录。
+	//
+	// 开了双重验证的账号，自动登录必然停在等短信 ——
+	// 每跑一次保活就发一条，用户手机上被反复轰炸。
+	// 面板的 autoLogin 已经检查过这个开关，CLI 这条路径也要检查，
+	// 否则定时脚本走 CLI 时照样会发短信。
+	if !acc.AutoKeepAliveOn() {
+		return false, "该账号已关闭自动保活，请手动登录"
+	}
 
 	fmt.Fprintf(os.Stderr, "[*] 会话失效，尝试账密自动登录（%s）…\n", id)
 	res, err := task.CamoufoxLogin(acc.Phone, acc.Password, "")

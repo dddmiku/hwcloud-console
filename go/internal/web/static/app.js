@@ -450,6 +450,18 @@ function renderAccount(a){
     ['状态', status],
     ['设备信任', trust],
   ];
+  // 自动保活开关。
+  //
+  // 关掉后保活只做纯协议续期，不再拉起浏览器走账密登录。
+  // 开了双重验证的账号必须关掉 —— 否则每次保活都会发一条短信，
+  // 用户手机上被反复轰炸，却不知道是后台在发。
+  const keepOn = a.auto_keep_alive !== false;
+  items.push(['自动保活',
+    '<span class="keepalive-sw" data-act="autokeepalive" data-arg="' +
+      (keepOn ? 'off' : 'on') + '">' +
+      (keepOn ? '<span class="ok">已开启</span>' : '<span class="warn">已关闭</span>') +
+      '<span class="hint">（点击' + (keepOn ? '关闭' : '开启') + '）</span>' +
+    '</span>']);
   if(a.username) items.push(['用户名', esc(a.username)]);
   // 积分：-1 表示取不到（离线/接口失败），显示 — 而不是 0
   items.push(['积分', a.beans >= 0
@@ -574,6 +586,9 @@ function bindAccountActions(){
       // （滑块自动过、短信验证码照常填），不需要用户再输密码。
       case 'relogin':  startRelogin(id); break;
       case 'beans':    queryBeans(id); break;
+      // 自动保活开关。data-arg 是**目标状态**（on/off），
+      // 渲染时就按当前状态算好了，这里不用再判断。
+      case 'autokeepalive': toggleAutoKeepAlive(id, arg === 'on'); break;
       case 'check':    checkAccount(id); break;
       case 'tasks':    showTasks(id); break;
       case 'remove':   removeAccount(id); break;
@@ -661,6 +676,28 @@ async function queryBeans(id){
     loadAccounts();
   }catch(e){
     showMsg('globalMsg', label + ' 积分查询失败: ' + e.message, false);
+  }
+}
+
+// toggleAutoKeepAlive 开关自动保活。
+//
+// 关掉的典型场景：开了双重验证的账号。自动登录走到发短信就卡住，
+// 而每次保活重试都会重新发一条，用户手机上被反复轰炸却找不到来源。
+async function toggleAutoKeepAlive(id, enable){
+  const a = accounts.find(x => x.id === id);
+  const label = a ? a.phone : id;
+  try{
+    const r = await api('/api/accounts/autokeepalive', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id, enabled: enable})
+    });
+    if(r.error){ throw new Error(r.error); }
+    showMsg('globalMsg',
+      label + ' 自动保活已' + (enable ? '开启' : '关闭') +
+      (enable ? '' : '（不会再自动发短信了）'), true);
+    loadAccounts();
+  }catch(e){
+    showMsg('globalMsg', label + ' 设置失败: ' + e.message, false);
   }
 }
 
