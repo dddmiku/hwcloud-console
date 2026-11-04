@@ -544,18 +544,15 @@ func RunHarmonyStar(sess *huawei.Session, stateDir string) (map[string]any, erro
 		"star_ok":      starResp.StarCount > before,
 	}
 
-	// 关键一步：触发华为云核验
-	st, raw, err = c.call("/api/growth/tasks/gitcode-star/submit", http.MethodPost,
-		map[string]any{"case_id": nil, "payload": map[string]any{"action": "check"}})
-	if err != nil {
-		out["check_error"] = err.Error()
-		return out, nil
-	}
-	if st != http.StatusOK {
-		out["check_status"] = fmt.Sprintf("HTTP %d", st)
-		out["check_detail"] = harmonyClip(string(raw))
-		return out, nil
-	}
+	// 关键一步：触发华为云核验。
+	//
+	// 为什么要重试：华为云侧要先去 GitCode 拉一次 star 状态才能判定。
+	// 刚 star 完立刻 check，它拉到的是旧数据，返回
+	// missing:["org:harmony-practice-center"] —— 实测 daily 里连着跑
+	// 就撞上过（日志显示「核验未通过」，但隔一会儿手工重跑就 success）。
+	// 所以按退避重试几次，直到 completed 或明确失败。
+	//
+	// 注意：check 是幂等的（只是触发一次核验），重复调用不会重复发分。
 	var chk struct {
 		Completed      bool   `json:"completed"`
 		AlreadyAwarded bool   `json:"already_awarded_today"`
@@ -567,7 +564,45 @@ func RunHarmonyStar(sess *huawei.Session, stateDir string) (map[string]any, erro
 			Failed  []string `json:"failed"`
 		} `json:"progress"`
 	}
-	if json.Unmarshal(raw, &chk) == nil {
+
+	// 退避序列：等华为云把 GitCode 的状态同步过来，总共约 45 秒。
+	// 再长就没意义了 —— daily 是串行跑的，不能为一个任务卡太久。
+	backoff := []time.Duration{0, 5 * time.Second, 10 * time.Second, 15 * time.Second, 15 * time.Second}
+	attempts := 0
+
+	for i, wait := range backoff {
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		attempts = i + 1
+
+		st, raw, err = c.call("/api/growth/tasks/gitcode-star/submit", http.MethodPost,
+			map[string]any{"case_id": nil, "payload": map[string]any{"action": "check"}})
+		if err != nil {
+			out["check_error"] = err.Error()
+			continue
+		}
+		if st != http.StatusOK {
+			out["check_status"] = fmt.Sprintf("HTTP %d", st)
+			out["check_detail"] = harmonyClip(string(raw))
+			continue
+		}
+
+		chk = struct {
+			Completed      bool   `json:"completed"`
+			AlreadyAwarded bool   `json:"already_awarded_today"`
+			AwardStatus    string `json:"award_status"`
+			Points         any    `json:"points"`
+			Progress       struct {
+				Matched []string `json:"matched"`
+				Missing []string `json:"missing"`
+				Failed  []string `json:"failed"`
+			} `json:"progress"`
+		}{}
+		if json.Unmarshal(raw, &chk) != nil {
+			out["check_raw"] = harmonyClip(string(raw))
+			continue
+		}
 		out["completed"] = chk.Completed
 		out["award_status"] = chk.AwardStatus
 		out["points"] = chk.Points
@@ -575,8 +610,17 @@ func RunHarmonyStar(sess *huawei.Session, stateDir string) (map[string]any, erro
 		out["matched"] = chk.Progress.Matched
 		out["missing"] = chk.Progress.Missing
 		out["failed"] = chk.Progress.Failed
-	} else {
-		out["check_raw"] = harmonyClip(string(raw))
+		out["check_attempts"] = attempts
+
+		if chk.Completed {
+			return out, nil
+		}
+		// 有 failed 说明是真的失败（不是同步延迟），重试也没用
+		if len(chk.Progress.Failed) > 0 {
+			return out, nil
+		}
 	}
+
+	out["check_attempts"] = attempts
 	return out, nil
 }

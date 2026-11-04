@@ -37,6 +37,8 @@ func usage() {
   drafts         列出草稿
   delete         删除已发布文章（--draft 删草稿）
   devspace       上报「体验 AI DevSpace」行为
+  daily          一键日常（签到+DevSpace+发文章+鸿蒙浏览+鸿蒙Star）
+  weekly         一键周常（云实验+Issue+Star+活动+赛事+鸿蒙云端实践）
   status         实践中心账号与 GitCode 绑定状态
   bind           绑定 GitCode 账号（--gitcode <用户名>）
   keepalive      用持久化 profile 刷新会话（失效时自动续期）
@@ -606,6 +608,31 @@ func Main(args []string) int {
 			return fail(err)
 		}
 		printJSON(result)
+		return 0
+
+	case "daily":
+		// 一键日常：签到 + DevSpace + 发文章 + 鸿蒙浏览 + 鸿蒙 Star。
+		// 和面板上那个「一键日常」是同一份逻辑（web.RunDailyForCLI）。
+		result := web.RunDailyForCLI()
+		printJSON(result)
+		if e, ok := result["error"].(string); ok && e != "" {
+			return 1
+		}
+		if ok, _ := result["ok"].(bool); !ok {
+			return 1
+		}
+		return 0
+
+	case "weekly":
+		// 一键周常：云实验 + 提Issue + Star仓库 + 活动 + 赛事 + 鸿蒙云端实践。
+		result := web.RunWeeklyForCLI()
+		printJSON(result)
+		if e, ok := result["error"].(string); ok && e != "" {
+			return 1
+		}
+		if ok, _ := result["ok"].(bool); !ok {
+			return 1
+		}
 		return 0
 
 	case "serve":

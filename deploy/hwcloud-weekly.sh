@@ -62,24 +62,30 @@ for acc in $(random_accounts); do
     fi
     rm -f /tmp/kaw.$$ "$d/state/NEED_MANUAL_LOGIN"
 
-    # 1. 云实验（已完成则跳过，省一次免费名额）
-    tasks_out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" tasks --stars 1,2,3,4,5 2>&1)
-    if echo "$tasks_out" | grep "实验" | grep -q "已完成"; then
-        log "[$acc] lab: 本周已完成，跳过"
-    else
-        log "[$acc] lab: 开始执行云实验"
-        out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" lab --headless 2>&1)
-        log "[$acc] lab: $(echo "$out" | tr '\n' ' ' | head -c 400)"
-    fi
-
-    # 2. 提 Issue（已完成则跳过，避免刷重复内容）
-    if echo "$tasks_out" | grep "Issue" | grep -q "已完成"; then
-        log "[$acc] issue: 本周已完成，跳过"
-    elif [ ! -f "$d/state/gitcode_state.json" ]; then
-        log "[$acc] issue: 无 GitCode 会话，跳过"
-    else
-        out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" issue 2>&1)
-        log "[$acc] issue: $(echo "$out" | tr '\n' ' ' | head -c 400)"
+    # 一键周常：云实验 + 提Issue + Star仓库 + 开发者活动 + 开发者赛事 + 鸿蒙云端实践
+    #
+    # 用 `weekly` 子命令而不是逐个 `lab` / `issue` 拼：
+    # 旧脚本只跑这两步，后来在 runWeekly 里加的 Star仓库 / 活动 / 赛事 /
+    # 鸿蒙云端实践全都没执行 —— 面板上看着「周常跑了」，实际大部分任务没做。
+    # 统一调 `weekly` 后，加任务只需要改 runWeekly 一处。
+    #
+    # `2>/dev/null` 而不是 `2>&1`：svcLog 写 stderr，stdout 只有结果 JSON。
+    out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" weekly 2>/dev/null)
+    rc=$?
+    summary=$(echo "$out" | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("(输出非 JSON)"); raise SystemExit
+print(d.get("msg",""))
+for s in d.get("steps",[]):
+    if not s.get("ok"):
+        print("  ✗ %s: %s" % (s.get("name"), s.get("msg","")[:80]))
+' 2>/dev/null)
+    log "[$acc] weekly(rc=$rc): $(echo "$summary" | tr '\n' ' ' | head -c 500)"
+    if [ $rc -ne 0 ]; then
+        overall=1
     fi
 done
 

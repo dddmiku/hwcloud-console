@@ -153,7 +153,13 @@ func (s *Server) pendingDrop(id string) {
 func svcLog(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
-	fmt.Print(line)
+	// 写 stderr 而不是 stdout。
+	//
+	// 原因：CLI 的 `hwcloud daily` 要把结果 JSON 打到 stdout 给脚本解析，
+	// 而 runDaily 里到处调 svcLog。写 stdout 会把 JSON 冲散，
+	// 脚本侧 json.load 直接失败（实测日志里全是「(输出非 JSON)」）。
+	// systemd 的 journal 一样能收到 stderr，不影响服务日志。
+	fmt.Fprint(os.Stderr, line)
 
 	dir := filepath.Join(config.Root(), "logs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1040,6 +1046,20 @@ func taskLabel(name string) string {
 		return "一键日常"
 	case "weekly":
 		return "一键周常"
+	case "cloud-practice":
+		return "鸿蒙云端实践"
+	case "harmony-daily":
+		return "鸿蒙浏览"
+	case "harmony-star-run":
+		return "鸿蒙Star"
+	case "harmony-bind":
+		return "鸿蒙绑定"
+	case "harmony-tasks":
+		return "鸿蒙任务"
+	case "harmony-star":
+		return "鸿蒙Star状态"
+	case "labs":
+		return "实验列表"
 	}
 	return name
 }
@@ -1121,10 +1141,33 @@ func (s *Server) startJob(id, name string) (*jobState, error) {
 
 			s.setJobStep(jobID, "执行中")
 			res = s.withAccount(id, func() any {
-				if name == "daily" {
+				switch name {
+				case "daily":
 					return s.runDaily()
+				case "cloud-practice":
+					// 鸿蒙「云端实践」(+100/周)。开浏览器 → 授权临时凭据 →
+					// 等 DevSpace 容器就绪 → 平台侧自己上报。
+					// 耗时 1~6 分钟，所以必须走异步 job。
+					out, err := task.RunCloudPractice(false)
+					if err != nil {
+						return map[string]any{
+							"label": taskLabel(name),
+							"ok":    false,
+							"msg":   err.Error(),
+							"steps": []map[string]any{{"name": "云端实践", "ok": false, "msg": err.Error()}},
+						}
+					}
+					ok, _ := out["ok"].(bool)
+					msg, _ := out["msg"].(string)
+					return map[string]any{
+						"label": taskLabel(name),
+						"ok":    ok,
+						"msg":   msg,
+						"steps": []map[string]any{{"name": "云端实践", "ok": ok, "msg": msg, "detail": out}},
+					}
+				default:
+					return s.runWeekly()
 				}
-				return s.runWeekly()
 			}).(map[string]any)
 		}()
 
@@ -1261,7 +1304,7 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	// 长任务（日常/周常）走异步：同步跑要几分钟，HTTP 会超时，
 	// 前端表现就是「点了没反应」。这里立即返回 job id，后台执行，
 	// 前端轮询 /api/jobs 看进度。
-	if name == "daily" || name == "weekly" {
+	if name == "daily" || name == "weekly" || name == "cloud-practice" {
 		job, err := s.startJob(id, name)
 		if err != nil {
 			writeJSON(w, map[string]any{"error": err.Error()})
@@ -3032,6 +3075,31 @@ func summarize(content string, n int) string {
 //
 // 顺序有讲究：先签到再 DevSpace 再发文章。签到是纯 API 调用最快，
 // 发文最慢（要起浏览器），放最后免得拖慢整体反馈。
+// RunDailyForCLI 供命令行调用的一键日常。
+//
+// 为什么需要它：定时任务 hwcloud-daily.sh 原来只跑 sign + devspace +
+// 查文章状态，不碰鸿蒙浏览 / 鸿蒙 Star —— 那两个是后来才加的，
+// 加在 runDaily 里但脚本没调 runDaily，所以定时跑了却「每日任务没做」。
+//
+// 这里把 runDaily 包一层导出，CLI 就能复用同一份逻辑，
+// 不用在 shell 里重写一遍（重写必然两边不同步）。
+func RunDailyForCLI() map[string]any {
+	s, err := NewServer("")
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	return s.runDaily()
+}
+
+// RunWeeklyForCLI 同上，供命令行调用一键周常。
+func RunWeeklyForCLI() map[string]any {
+	s, err := NewServer("")
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	return s.runWeekly()
+}
+
 func (s *Server) runDaily() map[string]any {
 	steps := []map[string]any{}
 	dStart := time.Now()
@@ -3121,7 +3189,18 @@ func (s *Server) runDaily() map[string]any {
 		svcLog("[daily] 鸿蒙Star需要先绑定 GitCode")
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "需要先绑定 GitCode"})
 	} else {
-		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "核验未通过", "detail": res})
+		// 失败时把核验细节打出来。
+		//
+		// 早先这里只记一句「核验未通过」，日志里看不到 missing/failed 是什么，
+		// 排查只能靠猜 —— 实测就是靠重试才发现是华为云侧同步 GitCode
+		// star 状态有延迟（missing 里带着 org:harmony-practice-center）。
+		svcLog("[daily] 鸿蒙Star核验未通过: missing=%v failed=%v attempts=%v",
+			res["missing"], res["failed"], res["check_attempts"])
+		msg := "核验未通过"
+		if m, ok := res["missing"].([]string); ok && len(m) > 0 {
+			msg = fmt.Sprintf("核验未通过（缺少 %v）", m)
+		}
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": msg, "detail": res})
 	}
 
 	svcLog("[daily] 结束，总耗时 %s", time.Since(dStart).Round(time.Second))
@@ -3332,26 +3411,35 @@ issueStep:
 	// 7. 鸿蒙实践中心：云端实践（每周 +100）
 	//
 	// 这条走不了纯协议 —— external_report 类型，submit 直接 403
-	// browser_submit_not_allowed，必须在 DevSpace 环境里真跑一次。
-	// 这里只查状态并提示，不硬跑，避免白占一次实验配额。
+	// browser_submit_not_allowed，上报由 DevSpace 环境内部完成。
+	// 现在改成开浏览器走完整流程：授权临时凭据 → 等环境就绪 → 平台自己上报。
+	// 详见 internal/task/cloud_practice.go。
 	stateDirW := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
-	svcLog("[weekly] 步骤6/6 鸿蒙云端实践：查询状态…")
+	svcLog("[weekly] 步骤6/6 鸿蒙云端实践…")
+	needPractice := true
 	if sessW, err := huawei.NewForAccount(stateDirW); err == nil {
 		if list, err := task.HarmonyTasks(sessW); err == nil {
 			for _, t := range list {
-				if t.TaskKey != "cloud-practice" {
-					continue
-				}
-				if t.Done {
-					svcLog("[weekly] 鸿蒙云端实践本周已完成")
-					steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": true, "msg": "本周已完成"})
-				} else {
-					svcLog("[weekly] 鸿蒙云端实践未完成（需 DevSpace 环境 + 实名主账号，无法纯协议）")
-					steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": false,
-						"msg": "需要 DevSpace 环境，暂无法自动化"})
+				if t.TaskKey == "cloud-practice" && t.Done {
+					needPractice = false
 				}
 			}
 		}
+	}
+
+	if !needPractice {
+		svcLog("[weekly] 鸿蒙云端实践本周已完成，跳过")
+		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": true, "msg": "本周已完成"})
+	} else if res, err := task.RunCloudPractice(false); err != nil {
+		svcLog("[weekly] 鸿蒙云端实践失败: %v", err)
+		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": false, "msg": err.Error()})
+	} else if ok, _ := res["ok"].(bool); ok {
+		svcLog("[weekly] 鸿蒙云端实践完成：环境已就绪")
+		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": true, "msg": "环境已就绪", "detail": res})
+	} else {
+		msg, _ := res["msg"].(string)
+		svcLog("[weekly] 鸿蒙云端实践未完成: %s", msg)
+		steps = append(steps, map[string]any{"name": "鸿蒙云端实践", "ok": false, "msg": msg, "detail": res})
 	}
 
 	svcLog("[weekly] 结束，总耗时 %s", time.Since(wStart).Round(time.Second))

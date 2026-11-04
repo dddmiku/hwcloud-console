@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# hwcloud 每日任务：对每个账号执行 签到 + DevSpace 行为上报。
+# hwcloud 每日任务：对每个账号执行完整的一键日常。
 #
 # 设计要点（都是踩过的坑）：
 #   1. 多账号：遍历 accounts/*/，通过 HWCLOUD_ACCOUNT 切换 state 目录。
 #      早先版本只跑默认账号，第二个账号从来没执行过。
-#   2. 会话兜底：sign/devspace 内部会走 ensureSession，但纯协议救不回来时
-#      会直接失败。所以先跑一次 keepalive --auto-login 把会话拉起来，
+#   2. 会话兜底：先跑一次 keepalive --auto-login 把会话拉起来，
 #      失败就跳过该账号并留标记，不要让后面的任务刷一堆 401。
-#   3. DISPLAY：DevSpace 之类可能拉起浏览器，服务器有 Xvfb :99。
-#   4. 不发文章：避免每天往公开博客刷内容，只报告是否已发。
+#   3. DISPLAY：DevSpace 之类会拉起浏览器，服务器有 Xvfb :99。
+#   4. 用 `hwcloud daily` 而不是逐个命令拼。
+#
+# 第 4 点是最重要的修正：
+#   早先这里是 `sign` + `devspace` + 查文章状态 三条命令拼起来的，
+#   后来在 runDaily 里加了「鸿蒙浏览 / 鸿蒙 Star」两个任务，
+#   但脚本没跟着改 —— 结果定时任务天天「成功」，面板上的每日任务
+#   却一直没做（实测某个账号的鸿蒙浏览、鸿蒙Star 长期未完成）。
+#   现在统一调 `hwcloud daily`，和面板上那个「一键日常」走同一份逻辑，
+#   以后加任务只需要改 runDaily 一处。
+#
+#   顺带说明「自动发布已禁用」：那是旧脚本里写死的
+#   `blog: 今日未发布（自动发布已禁用）` 提示 —— 旧版本故意不自动发文章，
+#   避免每天往公开博客刷内容。现在改用 runDaily，会正常发文章。
 #
 # 注意这里**故意不加 set -e**：
 #   脚本是「逐账号容错」的 —— 某个账号离线、某个任务失败，只跳过该账号
@@ -72,15 +83,32 @@ for acc in $(random_accounts); do
     fi
     rm -f /tmp/ka.$$ "$d/state/NEED_MANUAL_LOGIN"
 
-    out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" sign 2>&1); log "[$acc] sign: $(echo "$out" | head -3 | tr '\n' ' ')"
-    out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" devspace 2>&1); log "[$acc] devspace: $(echo "$out" | tr '\n' ' ' | head -c 200)"
-
-    # 文章只检查不发布
-    today=$(date '+%Y-%m-%d')
-    if HWCLOUD_ACCOUNT="$acc" "$BIN" blogs 2>&1 | grep -q "$today"; then
-        log "[$acc] blog: 今日已发布"
-    else
-        log "[$acc] blog: 今日未发布（自动发布已禁用）"
+    # 一键日常：签到 + DevSpace + 发文章 + 鸿蒙浏览 + 鸿蒙 Star
+    #
+    # 用 `daily` 子命令而不是逐个 `sign` / `devspace` 拼：
+    # 拼命令会和面板的 runDaily 逐渐脱节（鸿蒙那两个任务就是这么漏掉的）。
+    #
+    # 注意这里是 `2>/dev/null` 不是 `2>&1`：
+    # svcLog 写的是 stderr（进度日志），stdout 只有结果 JSON。
+    # 合并的话 JSON 会被日志行冲散，下面 json.load 必然失败 ——
+    # 实测日志里全是「(输出非 JSON)」。
+    out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" daily 2>/dev/null)
+    rc=$?
+    # 结果是一大坨 JSON，只取 msg 和失败项，避免日志被撑爆
+    summary=$(echo "$out" | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("(输出非 JSON)"); raise SystemExit
+print(d.get("msg",""))
+for s in d.get("steps",[]):
+    if not s.get("ok"):
+        print("  ✗ %s: %s" % (s.get("name"), s.get("msg","")[:80]))
+' 2>/dev/null)
+    log "[$acc] daily(rc=$rc): $(echo "$summary" | tr '\n' ' ' | head -c 400)"
+    if [ $rc -ne 0 ]; then
+        overall=1
     fi
 done
 
