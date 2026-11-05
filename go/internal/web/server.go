@@ -859,6 +859,34 @@ func (s *Server) handleAccountAutoKeepAlive(w http.ResponseWriter, r *http.Reque
 // 直接写 v, _ := m["k"].(T) 到处都是，容易漏判 nil 造成误报。
 func boolOf(v any) bool   { b, _ := v.(bool); return b }
 func strOf(v any) string  { s, _ := v.(string); return s }
+
+// looksLikeSessionExpired 判断 GitCode 错误是否为会话过期。
+//
+// 覆盖实测见过的几种形态：
+//   - 我们自己的前缀 GITCODE_EXPIRED:（task.IsGitCodeExpired）
+//   - `star 接口 HTTP 401: {"error_code":420,"error_code_name":"NOT_LOGIN_ERROR"}`
+//   - `仓库列表 HTTP 401 {"error_code":420,...}`
+//   - 老写法里可能出现的「会话」
+//
+// 上游文案会变，所以多留几个判据；宁可多重登一次，也别静默失败。
+func looksLikeSessionExpired(err error) bool {
+	if err == nil {
+		return false
+	}
+	if task.IsGitCodeExpired(err) {
+		return true
+	}
+	msg := err.Error()
+	for _, k := range []string{
+		"会话", "HTTP 401", "NOT_LOGIN_ERROR", "error_code\":420", "error_code\": 420",
+		"401", "token not found", "UNAUTHORIZED",
+	} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
 func floatOf(v any) float64 {
 	f, _ := v.(float64)
 	return f
@@ -1799,9 +1827,15 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 
 		case "star":
 			// 给组织下第一个还没 star 过的仓库点 Star。
-			// 会话失效时同样用存的账密重登一次再试。
+			// 会话失效时用存的账密重登一次再试。
+			//
+			// 判据不能只看 "会话" —— 实际错误是
+			// `star 接口 HTTP 401: {"error_code":420,...}` 或
+			// `HTTP 401 {"error_code":420,"error_code_name":"NOT_LOGIN_ERROR"}`
+			// 里根本没有「会话」两个字，早先的 Contains(err, "会话") 匹配不上，
+			// 重登兜底等于没写。
 			res, err := task.StarRepo(false)
-			if err != nil && strings.Contains(err.Error(), "会话") {
+			if err != nil && looksLikeSessionExpired(err) {
 				if acc.GitCodeUser == "" || acc.GitCodePass == "" {
 					return map[string]any{
 						"error": "GitCode 会话失效，且未保存账密无法自动重登",
@@ -3100,6 +3134,42 @@ func RunWeeklyForCLI() map[string]any {
 	return s.runWeekly()
 }
 
+// runHarmonyStarWithRelogin 跑鸿蒙 Star，GitCode 会话过期时自动重登一次。
+//
+// 为什么必须在这里重登：
+//   GITCODE_ACCESS_TOKEN 是 exp - iat = 24h 的 JWT，每天定时跑必然过期。
+//   实测 2026-11-05 09:35 的定时任务四个账号全部
+//   `star 接口 HTTP 401: {"error_code":420,"error_code_name":"NOT_LOGIN_ERROR"}`。
+//
+// 为什么不能在 RunHarmonyStar 里重登：
+//   那个函数是从无锁分支调进来的，而 LoginGitCodeAuto 走的是
+//   config.GitCodeProfileDir()（进程级全局）。全局账号没设置时会写到
+//   错误账号的 profile 里（见 hwcloud-account-context-leak）。
+//   runDaily 是在 withAccount 内执行的，此时全局账号是对的，可以安全重登。
+//
+// 重登失败不阻塞其它任务 —— 只把失败信息带回去。
+func (s *Server) runHarmonyStarWithRelogin(sess *huawei.Session, stateDir string) (map[string]any, error) {
+	res, err := task.RunHarmonyStar(sess, stateDir)
+	if err == nil || !task.IsGitCodeExpired(err) {
+		return res, err
+	}
+
+	svcLog("[daily] GitCode 会话已过期，尝试自动重登…")
+
+	acc, ok := s.store.Get(config.AccountID())
+	if !ok || acc.GitCodeUser == "" || acc.GitCodePass == "" {
+		return nil, fmt.Errorf("GitCode 会话过期，且未保存账密无法自动重登")
+	}
+
+	if _, lerr := task.LoginGitCodeAuto(acc.GitCodeUser, acc.GitCodePass, 180); lerr != nil {
+		return nil, fmt.Errorf("GitCode 会话过期，自动重登失败: %v", lerr)
+	}
+	svcLog("[daily] GitCode 重登成功，重试 Star")
+
+	// 重登后 gitcode_state.json 已更新，重新拼 Cookie 再试
+	return task.RunHarmonyStar(sess, stateDir)
+}
+
 func (s *Server) runDaily() map[string]any {
 	steps := []map[string]any{}
 	dStart := time.Now()
@@ -3179,7 +3249,7 @@ func (s *Server) runDaily() map[string]any {
 	svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓…")
 	if sess, err := huawei.NewForAccount(stateDir); err != nil {
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
-	} else if res, err := task.RunHarmonyStar(sess, stateDir); err != nil {
+	} else if res, err := s.runHarmonyStarWithRelogin(sess, stateDir); err != nil {
 		svcLog("[daily] 鸿蒙Star失败: %v", err)
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
 	} else if done, _ := res["completed"].(bool); done || res["already"] == true {

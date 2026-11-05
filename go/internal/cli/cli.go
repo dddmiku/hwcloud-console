@@ -150,6 +150,25 @@ func deriveSummary(content string, maxRunes int) string {
 	return text
 }
 
+// runWithStdoutToStderr 执行 fn，期间把进程的 stdout 重定向到 stderr。
+//
+// 用途：daily / weekly 的结果要是一段干净 JSON 给脚本解析，
+// 但内部逻辑（runDaily/runWeekly → LoginGitCodeAuto 等）里有大量
+// fmt.Printf 进度输出，会混进 stdout 把 JSON 冲散。
+//
+// 做法是临时替换 os.Stdout 这个文件描述符指向的句柄：
+// 保留原 stdout 的副本，把 os.Stdout 指向 stderr，跑完再换回来。
+// 这样 fn 里所有 fmt.Print* 都落到 stderr，而 printJSON 在恢复后
+// 仍然写真正的 stdout。
+//
+// 注意：这是进程级的，不能并发调用。CLI 是单进程单命令，没问题。
+func runWithStdoutToStderr(fn func() map[string]any) map[string]any {
+	orig := os.Stdout
+	os.Stdout = os.Stderr
+	defer func() { os.Stdout = orig }()
+	return fn()
+}
+
 func printJSON(v any) {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -613,7 +632,14 @@ func Main(args []string) int {
 	case "daily":
 		// 一键日常：签到 + DevSpace + 发文章 + 鸿蒙浏览 + 鸿蒙 Star。
 		// 和面板上那个「一键日常」是同一份逻辑（web.RunDailyForCLI）。
-		result := web.RunDailyForCLI()
+		//
+		// 为什么要重定向 stdout：
+		//   runDaily 内部会调 LoginGitCodeAuto（GitCode 会话过期时重登），
+		//   那个函数里有多处 fmt.Printf("[*] ...") 进度输出。
+		//   它们会混进 stdout，把结果 JSON 冲散 ——
+		//   定时脚本的 json.load 直接失败，日志里只剩「(输出非 JSON)」。
+		//   这里把执行期间的 stdout 全部转到 stderr，只让最后的 JSON 走 stdout。
+		result := runWithStdoutToStderr(web.RunDailyForCLI)
 		printJSON(result)
 		if e, ok := result["error"].(string); ok && e != "" {
 			return 1
@@ -625,7 +651,8 @@ func Main(args []string) int {
 
 	case "weekly":
 		// 一键周常：云实验 + 提Issue + Star仓库 + 活动 + 赛事 + 鸿蒙云端实践。
-		result := web.RunWeeklyForCLI()
+		// 同样重定向 stdout，理由见上面 daily 分支的注释。
+		result := runWithStdoutToStderr(web.RunWeeklyForCLI)
 		printJSON(result)
 		if e, ok := result["error"].(string); ok && e != "" {
 			return 1

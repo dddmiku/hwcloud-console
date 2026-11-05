@@ -40,6 +40,15 @@ const (
 	// 心跳间隔。前端是 5 秒（mr=5e3），服务端 max_gap_ms 是 15000，
 	// 留足余量取 5 秒。
 	harmonyBeatInterval = 5 * time.Second
+
+	// errGitCodeExpired 是 GitCode 会话过期的错误前缀。
+	//
+	// GITCODE_ACCESS_TOKEN 是 exp - iat = 24h 的 JWT，每天定时跑必然过期。
+	// 用固定前缀让调用方能用 strings.Contains 判定，而不是去匹配
+	// 「HTTP 401」「NOT_LOGIN_ERROR」「420」这些会随上游文案变化的字符串。
+	// 触发重登的代码在 web 层的 runDaily（那里持有账号锁，
+	// 调 LoginGitCodeAuto 才会写到正确的账号目录）。
+	errGitCodeExpired = "GITCODE_EXPIRED: "
 )
 
 // HarmonyTask HarmonyOS 实践中心任务执行结果
@@ -507,6 +516,21 @@ func RunHarmonyStar(sess *huawei.Session, stateDir string) (map[string]any, erro
 
 	repos, err := listGitcodeRepos(cookie, harmonyOrg)
 	if err != nil {
+		// 401 / NOT_LOGIN_ERROR 说明 GitCode 会话过期。
+		//
+		// 这个 token 的有效期只有 24 小时左右（GITCODE_ACCESS_TOKEN 是
+		// 一个 exp - iat = 24h 的 JWT），所以每天定时跑必然撞上。
+		// 打成特定前缀，让调用方（runDaily）能识别并触发一次自动重登。
+		//
+		// 为什么不在这个函数里直接重登：
+		//   LoginGitCodeAuto 走 config.GitCodeProfileDir()，那是进程级全局
+		//   （见 hwcloud-account-context-leak）。RunHarmonyStar 是从无锁分支
+		//   调进来的，全局账号没被设置，直接重登会写错账号的 profile。
+		msg := err.Error()
+		if strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "NOT_LOGIN_ERROR") ||
+			strings.Contains(msg, "420") {
+			return nil, fmt.Errorf("%s%s", errGitCodeExpired, msg)
+		}
 		return nil, err
 	}
 	if len(repos) == 0 {
@@ -528,6 +552,13 @@ func RunHarmonyStar(sess *huawei.Session, stateDir string) (map[string]any, erro
 		return nil, err
 	}
 	if st != http.StatusOK && st != http.StatusCreated {
+		// 401 也带过期前缀 —— 实测 token 过期时，仓库列表可能还能返回
+		// （走的是未登录可见的公开数据），但 POST /star 会 401。
+		// 只在 listGitcodeRepos 加判断会漏掉这种情况。
+		if st == http.StatusUnauthorized {
+			return nil, fmt.Errorf("%sstar 接口 HTTP %d: %s",
+				errGitCodeExpired, st, harmonyClip(string(raw)))
+		}
 		return nil, fmt.Errorf("star 接口 HTTP %d: %s", st, harmonyClip(string(raw)))
 	}
 	var starResp struct {
@@ -623,4 +654,13 @@ func RunHarmonyStar(sess *huawei.Session, stateDir string) (map[string]any, erro
 
 	out["check_attempts"] = attempts
 	return out, nil
+}
+
+// IsGitCodeExpired 判断错误是否为 GitCode 会话过期。
+//
+// 调用方（web 层的 runDaily）据此决定要不要触发一次自动重登。
+// 用前缀判定而不是匹配上游文案：401 / NOT_LOGIN_ERROR / 420 都可能变，
+// 但我们自己加的前缀不会变。
+func IsGitCodeExpired(err error) bool {
+	return err != nil && strings.Contains(err.Error(), errGitCodeExpired)
 }
