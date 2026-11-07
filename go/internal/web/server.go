@@ -3207,6 +3207,34 @@ func (s *Server) runDaily() map[string]any {
 	// 用 withAccount 保存会话 —— sync.Mutex 不可重入，会直接自锁死。
 	// 会话检查已由 startJob 在进入 withAccount 之前完成。
 
+	// 先读一次成长中心任务状态，已完成的步骤直接跳过。
+	//
+	// 为什么必须这样：这四个步骤都是「产生外部副作用」的动作 ——
+	// 重复跑会重复发文章（公开博客刷屏）、重复点 DevSpace、重复开案例页。
+	// 而 daily 会被手动点、定时器、补跑脚本各触发一次，同一天跑多次很正常。
+	// 成长中心的 is_finish 是权威判定，早上已完成就该跳过。
+	doneToday := map[string]bool{}
+	if sess0, err := huawei.New(""); err == nil {
+		if ms, err := huawei.TasksByStar(sess0, 1, 2); err == nil {
+			for _, m := range ms {
+				if m.IsFinish == 1 {
+					doneToday[m.Title] = true
+				}
+			}
+			svcLog("[daily] 今日已完成 %d 项，跳过对应步骤", len(doneToday))
+		}
+	}
+	skipIfDone := func(name, match string) bool {
+		for title := range doneToday {
+			if strings.Contains(title, match) {
+				svcLog("[daily] %s 今日已完成，跳过", name)
+				steps = append(steps, map[string]any{"name": name, "ok": true, "msg": "今日已完成，跳过"})
+				return true
+			}
+		}
+		return false
+	}
+
 	// 1. 签到
 	svcLog("[daily] 步骤1/3 签到…")
 	if sess, err := huawei.New(""); err != nil {
@@ -3229,36 +3257,40 @@ func (s *Server) runDaily() map[string]any {
 	// 虽然返回 success，但成长中心判定不通过（它认页面行为事件）。
 	// 实测 2026-11-07 浏览器打开实践中心 → 点「前往AI DevSpace实践」
 	// → 进入 AI 开发者空间后，成长中心「每日体验AI DevSpace」变成已完成。
-	svcLog("[daily] 步骤2/5 DevSpace（浏览器）…")
-	if res, err := task.RunDevSpaceBrowser(nil, false); err != nil {
-		svcLog("[daily] DevSpace 失败: %v", err)
-		steps = append(steps, map[string]any{"name": "DevSpace", "ok": false, "msg": err.Error()})
-	} else {
-		svcLog("[daily] DevSpace 已通过浏览器体验")
-		steps = append(steps, map[string]any{"name": "DevSpace", "ok": true, "msg": "已体验", "detail": res})
+	if !skipIfDone("DevSpace", "DevSpace") {
+		svcLog("[daily] 步骤2/5 DevSpace（浏览器）…")
+		if res, err := task.RunDevSpaceBrowser(nil, false); err != nil {
+			svcLog("[daily] DevSpace 失败: %v", err)
+			steps = append(steps, map[string]any{"name": "DevSpace", "ok": false, "msg": err.Error()})
+		} else {
+			svcLog("[daily] DevSpace 已通过浏览器体验")
+			steps = append(steps, map[string]any{"name": "DevSpace", "ok": true, "msg": "已体验", "detail": res})
+		}
 	}
 
 	// 3. 发文章
 	//
 	// 走浏览器编辑器：纯协议 PublishBlogAPI 返回 success 但成长中心不认。
 	// 实测 2026-11-07 用浏览器发布后「每日发布文章」立即变成已完成。
-	svcLog("[daily] 步骤3/5 发文章（浏览器）…")
-	if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "blog_post.md")); err != nil {
-		svcLog("[daily] 发文章缺少 blog_post.md")
-		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "缺少 data/blog_post.md"})
-	} else if title, content := parseBlogMarkdown(string(raw)); title == "" {
-		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "文章缺少 # 标题"})
-	} else if res, err := task.PublishBlog(task.BlogOptions{
-		Title:    title,
-		Summary:  summarize(content, 100),
-		Content:  content,
-		Headless: false,
-	}); err != nil {
-		svcLog("[daily] 发文章失败: %v", err)
-		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": err.Error()})
-	} else {
-		svcLog("[daily] 发文章成功: %v", res["url"])
-		steps = append(steps, map[string]any{"name": "发文章", "ok": true, "msg": "已发布", "detail": res})
+	if !skipIfDone("发文章", "发布文章") {
+		svcLog("[daily] 步骤3/5 发文章（浏览器）…")
+		if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "blog_post.md")); err != nil {
+			svcLog("[daily] 发文章缺少 blog_post.md")
+			steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "缺少 data/blog_post.md"})
+		} else if title, content := parseBlogMarkdown(string(raw)); title == "" {
+			steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "文章缺少 # 标题"})
+		} else if res, err := task.PublishBlog(task.BlogOptions{
+			Title:    title,
+			Summary:  summarize(content, 100),
+			Content:  content,
+			Headless: false,
+		}); err != nil {
+			svcLog("[daily] 发文章失败: %v", err)
+			steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": err.Error()})
+		} else {
+			svcLog("[daily] 发文章成功: %v", res["url"])
+			steps = append(steps, map[string]any{"name": "发文章", "ok": true, "msg": "已发布", "detail": res})
+		}
 	}
 
 	// 4/5. 鸿蒙实践中心的每日任务（浏览器，各约 40 秒 / 1 分钟）
@@ -3275,41 +3307,46 @@ func (s *Server) runDaily() map[string]any {
 	// 注意 dwell 要真的耗 30 秒，所以放在最后，避免拖慢前面的任务。
 	stateDir := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
 
-	svcLog("[daily] 步骤4/5 鸿蒙每日浏览案例（浏览器）…")
-	if sess, err := huawei.NewForAccount(stateDir); err != nil {
-		svcLog("[daily] 鸿蒙浏览失败（建会话）: %v", err)
-		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
-	} else if res, err := task.RunHarmonyDwellBrowser(sess, false, 60); err != nil {
-		svcLog("[daily] 鸿蒙浏览失败: %v", err)
-		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
-	} else if done, _ := res["done"].(bool); done || res["already"] == true {
-		svcLog("[daily] 鸿蒙浏览完成")
-		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": true, "msg": "+10", "detail": res})
-	} else {
-		msg, _ := res["msg"].(string)
-		svcLog("[daily] 鸿蒙浏览未完成: %s", msg)
-		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": msg, "detail": res})
+	if !skipIfDone("鸿蒙浏览案例", "浏览") {
+		svcLog("[daily] 步骤4/5 鸿蒙每日浏览案例（浏览器）…")
+		if sess, err := huawei.NewForAccount(stateDir); err != nil {
+			svcLog("[daily] 鸿蒙浏览失败（建会话）: %v", err)
+			steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
+		} else if res, err := task.RunHarmonyDwellBrowser(sess, false, 60); err != nil {
+			svcLog("[daily] 鸿蒙浏览失败: %v", err)
+			steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
+		} else if done, _ := res["done"].(bool); done || res["already"] == true {
+			svcLog("[daily] 鸿蒙浏览完成")
+			steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": true, "msg": "+10", "detail": res})
+		} else {
+			msg, _ := res["msg"].(string)
+			svcLog("[daily] 鸿蒙浏览未完成: %s", msg)
+			steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": msg, "detail": res})
+		}
 	}
 
-	svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓（浏览器）…")
-	if sess, err := huawei.NewForAccount(stateDir); err != nil {
-		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
-	} else if res, err := s.runHarmonyStarBrowserWithRelogin(sess, stateDir); err != nil {
-		svcLog("[daily] 鸿蒙Star失败: %v", err)
-		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
-	} else if done, _ := res["completed"].(bool); done || res["already"] == true {
-		svcLog("[daily] 鸿蒙Star完成")
-		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": true, "msg": "+30", "detail": res})
-	} else if need, _ := res["need_binding"].(bool); need {
-		svcLog("[daily] 鸿蒙Star需要先绑定 GitCode")
-		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "需要先绑定 GitCode"})
-	} else if pending, _ := res["pending_check"].(bool); pending {
-		// Star 已经真的点上了，只是华为云侧还没同步到。这不是失败，
-		// 但也还不能算成功 —— 重复点会变成取消 Star，所以留给下次跑。
-		msg, _ := res["msg"].(string)
-		svcLog("[daily] 鸿蒙Star待同步: %s", msg)
-		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": msg, "detail": res})
-	} else {
+	// 注意 match 必须足够具体：周常任务里也有「每周Star一个Agent开发实践中心
+	// 代码仓」，用泛化的 "Star" 会误匹配，导致每日 Star 被跳过。
+	if !skipIfDone("鸿蒙Star", "Star一个鸿蒙案例") {
+		svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓（浏览器）…")
+		if sess, err := huawei.NewForAccount(stateDir); err != nil {
+			steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
+		} else if res, err := s.runHarmonyStarBrowserWithRelogin(sess, stateDir); err != nil {
+			svcLog("[daily] 鸿蒙Star失败: %v", err)
+			steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
+		} else if done, _ := res["completed"].(bool); done || res["already"] == true {
+			svcLog("[daily] 鸿蒙Star完成")
+			steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": true, "msg": "+30", "detail": res})
+		} else if need, _ := res["need_binding"].(bool); need {
+			svcLog("[daily] 鸿蒙Star需要先绑定 GitCode")
+			steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "需要先绑定 GitCode"})
+		} else if pending, _ := res["pending_check"].(bool); pending {
+			// Star 已经真的点上了，只是华为云侧还没同步到。这不是失败，
+			// 但也还不能算成功 —— 重复点会变成取消 Star，所以留给下次跑。
+			msg, _ := res["msg"].(string)
+			svcLog("[daily] 鸿蒙Star待同步: %s", msg)
+			steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": msg, "detail": res})
+		} else {
 		// 失败时把核验细节打出来。
 		//
 		// 早先这里只记一句「核验未通过」，日志里看不到 missing/failed 是什么，
@@ -3322,6 +3359,7 @@ func (s *Server) runDaily() map[string]any {
 			msg = fmt.Sprintf("核验未通过（缺少 %v）", m)
 		}
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": msg, "detail": res})
+		}
 	}
 
 	svcLog("[daily] 结束，总耗时 %s", time.Since(dStart).Round(time.Second))
