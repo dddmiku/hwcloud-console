@@ -102,9 +102,10 @@ func PublishBlog(opts BlogOptions) (map[string]any, error) {
 	}
 
 	if opts.Draft {
-		resp, err := page.ExpectResponse(func(r playwright.Response) bool {
-			return strings.Contains(r.URL(), "save-draft")
-		}, func() error {
+		// ExpectResponse 的第一个参数在本版本的 playwright-go 里是
+		// url 或 func(string) bool 的 URL 谓词，不是 func(Response) bool。
+		// 之前传的是后者，运行时直接 panic: invalid urlOrPredicate。
+		resp, err := page.ExpectResponse("**/save-draft*", func() error {
 			return page.Locator("#draft-btn").Click(playwright.LocatorClickOptions{Force: playwright.Bool(true)})
 		}, playwright.PageExpectResponseOptions{Timeout: playwright.Float(60000)})
 		if err != nil {
@@ -120,9 +121,7 @@ func PublishBlog(opts BlogOptions) (map[string]any, error) {
 	}
 	page.WaitForTimeout(1000)
 
-	resp, err := page.ExpectResponse(func(r playwright.Response) bool {
-		return strings.Contains(r.URL(), "blog/blogging")
-	}, func() error {
+	resp, err := page.ExpectResponse("**/blog/blogging*", func() error {
 		return page.Locator("#submit-btn").Click(playwright.LocatorClickOptions{Force: playwright.Bool(true)})
 	}, playwright.PageExpectResponseOptions{Timeout: playwright.Float(60000)})
 	if err != nil {

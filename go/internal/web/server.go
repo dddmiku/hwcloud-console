@@ -3134,6 +3134,33 @@ func RunWeeklyForCLI() map[string]any {
 	return s.runWeekly()
 }
 
+// runHarmonyStarBrowserWithRelogin 浏览器版 Star，GitCode 会话失效时自动重登一次。
+//
+// 为什么要单独包一层：浏览器版会在页面上直接点 Star，会话失效时表现是
+// 页面显示未登录、按钮点不动（而不是像纯协议那样返回 401），
+// 所以这里在开始前先探一次 GitCode 会话是否有效，失效就先重登。
+func (s *Server) runHarmonyStarBrowserWithRelogin(sess *huawei.Session, stateDir string) (map[string]any, error) {
+	res, err := task.RunHarmonyStarBrowser(sess, stateDir, false)
+	if err == nil {
+		return res, nil
+	}
+	// 只有明确的 GitCode 过期信号才重登；其它错误直接返回
+	if !task.IsGitCodeExpired(err) && !strings.Contains(strings.ToLower(err.Error()), "gitcode") {
+		return res, err
+	}
+
+	svcLog("[daily] GitCode 会话异常，尝试自动重登…")
+	acc, ok := s.store.Get(config.AccountID())
+	if !ok || acc.GitCodeUser == "" || acc.GitCodePass == "" {
+		return nil, fmt.Errorf("GitCode 会话过期，且未保存账密无法自动重登")
+	}
+	if _, lerr := task.LoginGitCodeAuto(acc.GitCodeUser, acc.GitCodePass, 180); lerr != nil {
+		return nil, fmt.Errorf("GitCode 会话过期，自动重登失败: %v", lerr)
+	}
+	svcLog("[daily] GitCode 重登成功，重试 Star")
+	return task.RunHarmonyStarBrowser(sess, stateDir, false)
+}
+
 // runHarmonyStarWithRelogin 跑鸿蒙 Star，GitCode 会话过期时自动重登一次。
 //
 // 为什么必须在这里重登：
@@ -3197,23 +3224,36 @@ func (s *Server) runDaily() map[string]any {
 	}
 
 	// 2. DevSpace
-	svcLog("[daily] 步骤2/3 DevSpace…")
-	if res, err := task.TrackDevSpace(); err != nil {
+	//
+	// 必须走浏览器：纯协议的 /api/track/visit + /api/track/aishell_click
+	// 虽然返回 success，但成长中心判定不通过（它认页面行为事件）。
+	// 实测 2026-11-07 浏览器打开实践中心 → 点「前往AI DevSpace实践」
+	// → 进入 AI 开发者空间后，成长中心「每日体验AI DevSpace」变成已完成。
+	svcLog("[daily] 步骤2/5 DevSpace（浏览器）…")
+	if res, err := task.RunDevSpaceBrowser(nil, false); err != nil {
 		svcLog("[daily] DevSpace 失败: %v", err)
 		steps = append(steps, map[string]any{"name": "DevSpace", "ok": false, "msg": err.Error()})
 	} else {
-		svcLog("[daily] DevSpace 已上报")
-		steps = append(steps, map[string]any{"name": "DevSpace", "ok": true, "msg": "已上报", "detail": res})
+		svcLog("[daily] DevSpace 已通过浏览器体验")
+		steps = append(steps, map[string]any{"name": "DevSpace", "ok": true, "msg": "已体验", "detail": res})
 	}
 
 	// 3. 发文章
-	svcLog("[daily] 步骤3/5 发文章…")
+	//
+	// 走浏览器编辑器：纯协议 PublishBlogAPI 返回 success 但成长中心不认。
+	// 实测 2026-11-07 用浏览器发布后「每日发布文章」立即变成已完成。
+	svcLog("[daily] 步骤3/5 发文章（浏览器）…")
 	if raw, err := os.ReadFile(filepath.Join(config.DataDir(), "blog_post.md")); err != nil {
 		svcLog("[daily] 发文章缺少 blog_post.md")
 		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "缺少 data/blog_post.md"})
 	} else if title, content := parseBlogMarkdown(string(raw)); title == "" {
 		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": "文章缺少 # 标题"})
-	} else if res, err := task.PublishBlogAPI(title, summarize(content, 100), content, false, nil); err != nil {
+	} else if res, err := task.PublishBlog(task.BlogOptions{
+		Title:    title,
+		Summary:  summarize(content, 100),
+		Content:  content,
+		Headless: false,
+	}); err != nil {
 		svcLog("[daily] 发文章失败: %v", err)
 		steps = append(steps, map[string]any{"name": "发文章", "ok": false, "msg": err.Error()})
 	} else {
@@ -3221,20 +3261,25 @@ func (s *Server) runDaily() map[string]any {
 		steps = append(steps, map[string]any{"name": "发文章", "ok": true, "msg": "已发布", "detail": res})
 	}
 
-	// 4/5. 鸿蒙实践中心的每日任务（纯协议，各约 30 秒 / 几秒）
+	// 4/5. 鸿蒙实践中心的每日任务（浏览器，各约 40 秒 / 1 分钟）
 	//
 	// 这两个是独立的成长中心（harmonybp.developer.huaweicloud.com），
 	// 和上面三个任务不共享状态，失败不影响其它步骤。
 	//
-	// 注意 dwell 要真的耗 30 秒（服务端按心跳累积计时），
-	// 所以放在最后，避免拖慢前面的签到/文章。
+	// 两个任务都必须走真实页面：
+	//   - 浏览：成长中心认页面上的心跳行为，纯协议心跳鸿蒙自己记 done
+	//     但成长中心不认（两套判定未打通）；
+	//   - Star：必须走「案例详情页 → GitCode 仓库页 → 点 Star」，
+	//     且每日要 Star 一个不同仓库（重复 star 同一仓不产生新记录）。
+	//
+	// 注意 dwell 要真的耗 30 秒，所以放在最后，避免拖慢前面的任务。
 	stateDir := filepath.Join(config.Root(), "accounts", config.AccountID(), "state")
 
-	svcLog("[daily] 步骤4/5 鸿蒙每日浏览案例…")
+	svcLog("[daily] 步骤4/5 鸿蒙每日浏览案例（浏览器）…")
 	if sess, err := huawei.NewForAccount(stateDir); err != nil {
 		svcLog("[daily] 鸿蒙浏览失败（建会话）: %v", err)
 		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
-	} else if res, err := task.RunHarmonyDwell(sess, 120); err != nil {
+	} else if res, err := task.RunHarmonyDwellBrowser(sess, false, 60); err != nil {
 		svcLog("[daily] 鸿蒙浏览失败: %v", err)
 		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": err.Error()})
 	} else if done, _ := res["done"].(bool); done || res["already"] == true {
@@ -3243,13 +3288,13 @@ func (s *Server) runDaily() map[string]any {
 	} else {
 		msg, _ := res["msg"].(string)
 		svcLog("[daily] 鸿蒙浏览未完成: %s", msg)
-		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": msg})
+		steps = append(steps, map[string]any{"name": "鸿蒙浏览案例", "ok": false, "msg": msg, "detail": res})
 	}
 
-	svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓…")
+	svcLog("[daily] 步骤5/5 鸿蒙 Star 案例仓（浏览器）…")
 	if sess, err := huawei.NewForAccount(stateDir); err != nil {
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
-	} else if res, err := s.runHarmonyStarWithRelogin(sess, stateDir); err != nil {
+	} else if res, err := s.runHarmonyStarBrowserWithRelogin(sess, stateDir); err != nil {
 		svcLog("[daily] 鸿蒙Star失败: %v", err)
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": err.Error()})
 	} else if done, _ := res["completed"].(bool); done || res["already"] == true {
@@ -3258,6 +3303,12 @@ func (s *Server) runDaily() map[string]any {
 	} else if need, _ := res["need_binding"].(bool); need {
 		svcLog("[daily] 鸿蒙Star需要先绑定 GitCode")
 		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": "需要先绑定 GitCode"})
+	} else if pending, _ := res["pending_check"].(bool); pending {
+		// Star 已经真的点上了，只是华为云侧还没同步到。这不是失败，
+		// 但也还不能算成功 —— 重复点会变成取消 Star，所以留给下次跑。
+		msg, _ := res["msg"].(string)
+		svcLog("[daily] 鸿蒙Star待同步: %s", msg)
+		steps = append(steps, map[string]any{"name": "鸿蒙Star", "ok": false, "msg": msg, "detail": res})
 	} else {
 		// 失败时把核验细节打出来。
 		//
