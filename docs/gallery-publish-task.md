@@ -54,7 +54,79 @@
 - 成功后服务端**即时代为领取成长积分**，结果在响应 `data.reward` 返回
 - **当月重复领取仍返回 `is_success: true` 但不发分** —— 无法从响应判断
 
+## 官方推荐路径：在 AI DevSpace 里让 AI 干活（2026-11-08 第四轮）
+
+用户确认：**正确做法是在 AI 对话里发布任务，AI 自己装 Skill 干活**，
+最后让用户授权 GitCode、选活动。这条路不需要自己搞 AK/SK ——
+DevSpace 环境会把临时凭据同步进去。
+
+### 已探明的入口链路
+
+```
+hands-on-agent.developer.huaweicloud.com/#tasks
+  → 点「前往AI DevSpace实践」
+  → devstation.developer.huaweicloud.com/aidevspace?dc=<签名>
+```
+
+进入后要连过 4 道弹窗（都验证过结构）：
+
+| 顺序 | 弹窗 | 真实 DOM | 处理方式 |
+|---|---|---|---|
+| 1 | 华为云开发者服务协议 | `input.por-native`(隐藏) + `<label for="protocolSign">` + `a#protocol-submit-btn` | 点 **label[for]**（点 span/外层 div 无效），两个都勾后才 enable |
+| 2 | 临时凭据自动配置 | `.tiny-dialog-box` + `.tiny-button--primary`（文字「同意」） | 直接点 |
+| 3 | CodeArts 代码智能体开通 | `label` + 「立即开通」按钮 | 勾同意后点「立即开通」 |
+| 4 | 进入对话界面 | — | — |
+
+**坑：**
+- 协议弹窗的两个 checkbox 是 `input.por-native`（`opacity:0` 隐藏），
+  **必须 `label[for=<id>].click()`**。点 span / 点外层 div / 直接 `inp.click()`
+  都不会让 Vue 更新状态，「进入」按钮一直 disabled。
+- 弹窗顺序不固定（实测先出「临时凭据」，再出「CodeArts 开通」），
+  必须**每轮重新检测当前弹窗类型**，不能按固定顺序写。
+- 页面上可能同时存在多个 `.tiny-button--primary`（例如别处的「同意」），
+  必须**限定在弹窗容器内**再点，否则会点到无关按钮。
+
+### 官方发布流程（submit-guide 页原文）
+
+```
+步骤 1  生成并验收作品（在 AI 对话里描述需求，AI 生成代码并运行）
+步骤 2  在 AI 对话中安装 Skill 并发出发布口令，按提示完成提交
+步骤 3  发布朋友圈（作品详情页点「分享作品」）
+```
+
+Skill 安装命令：
+
+```bash
+npx skills add https://gitcode.com/Lingxi-HandsOn/gallery.git \
+  --skill huawei-cloud-publish-work-to-gallery -y
+```
+
+发布口令：
+
+```
+请将当前项目发布至开发者作品展览馆。
+```
+
+之后 AI 会自动：识别作品目录 → 授权身份 → 检查 Git 仓库 →
+生成封面/简介/详情图 → 列出可投稿活动 → 提交 → 返回作品链接。
+
+**用户需要做的**：在 Skill 提示时登录/授权 GitCode，以及**选活动**
+（用户说选第一个即可）。
+
+### Skill 底层调用的接口（已读源码确认）
+
+```
+POST /open-api-public/v1/gallery/works   (multipart)
+Headers: X-Tmp-Ak / X-Tmp-Sk / X-Security-Token  ← STS 临时凭证
+```
+
+STS 凭证由 DevSpace 环境提供（就是「临时凭据自动配置」那个弹窗同步进去的
+AK/SK），所以走这条路**不需要用户手填 AK/SK**。
+
+---
+
 ## 实测结论（2026-11-08，第三轮，全部 Observed）
+
 
 **用户提示「原本就是华为云跳转的」是对的 —— 本轮把展览馆登录 + uniPortal 绑定
 全部打通了。** 之前判断「uniPortal 是独立账号体系」是错的。
