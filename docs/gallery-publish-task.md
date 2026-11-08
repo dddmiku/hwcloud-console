@@ -54,9 +54,107 @@
 - 成功后服务端**即时代为领取成长积分**，结果在响应 `data.reward` 返回
 - **当月重复领取仍返回 `is_success: true` 但不发分** —— 无法从响应判断
 
-## 实测结论（2026-11-08，第二轮，全部 Observed）
+## 实测结论（2026-11-08，第三轮，全部 Observed）
 
-第二轮做了更深入的探测，**确认了 3 个新事实，也确认了一个新的硬阻塞**：
+**用户提示「原本就是华为云跳转的」是对的 —— 本轮把展览馆登录 + uniPortal 绑定
+全部打通了。** 之前判断「uniPortal 是独立账号体系」是错的。
+
+### ✅ 完整链路（已验证走通）
+
+```
+1. 打开展览馆，页面自动 POST /open-web-guest/v1/gallery/auth/eui-login
+   → 200 {"success":true}
+   → 展览馆有了 eui 会话（eui-me 返回 nickName）
+
+2. 带 x-csrf-token POST /open-web-user/v1/gallery/auth/oauth/bind/start
+   {"providerId":"003d668803421000","consent":true}
+   → 200 拿到 authorizeUrl（uniportal saaslogin1/oauth2/authorize?...）
+
+3. 打开 authorizeUrl → 落到 uniportal 密码登录页
+   关键：改成访问 /uniportal1/oauth2/hwid?redirect=<原 redirect>
+   → 自动走华为云 OAuth：
+     oauth-login.cloud.huawei.com/oauth2/v3/authorize
+     oauth-login1.cloud.huawei.com/oauth2/v3/loginCallback
+   → 落到 uniportal/firstCompleteUserInfo.html（首次自动创建 uniPortal 账号）
+
+4. 该页两个协议勾选框是 Element UI 的 <label class="el-checkbox">，
+   Vue 把点击绑在 label 上（点外层 div / 点 input 都无效，按钮会一直 disabled）：
+     - 用 l.click() 点 label 本身
+     - 验证 input.checked === true 后再继续
+   → 点「Agree and Continue」
+   → uniportal commonRedirectionPage → gallery/profile
+
+5. 验证绑定成功：
+   GET /open-web-user/v1/gallery/auth/oauth/links
+   → {"data":[{"providerId":"003d668803421000","providerName":"uniPortal",
+               "providerUserName":"hw...","tokenValid":true}]}
+```
+
+### 🔑 关键配置（从 uniportal app-policy 接口读到的）
+
+```
+GET https://uniportal.huawei.com/uniportal1/rest/hwidcenter/app-policy
+
+{
+  "enablehwidLogin": 1,
+  "hwLoginAddress": "/oauth2/hwid",        ← 华为云账号登录入口
+  "hwLoginAddressMobile": "/jssdklogin",
+  "loginType": ["account","sms"],
+  "accountLoginMode": "accountName,mobile,email,w3Account",
+  "thirdPartyAllow": true,
+  "tenantId": 5
+}
+```
+
+`enablehwidLogin:1` + `hwLoginAddress:/oauth2/hwid` 就是「华为云账号直接登录
+uniPortal」的开关。**uniPortal 账号会在首次登录时自动创建**，
+不需要单独注册，也不需要 W3 账号。
+
+### 🔑 接口名坑：my-works 是旧接口
+
+| 接口 | 结果 |
+|---|---|
+| `GET /open-web-user/v1/gallery/my-works` | ❌ 401 `not_authenticated`（旧接口，已废弃） |
+| `GET /open-web-user/v1/gallery/me/works` | ✅ 200 `{"items":[],"total":0}` |
+
+**必须用 `/me/works`**。前端 bundle 里两个都有，但只有后者有效。
+
+其它已验证可用：
+
+```
+GET  /open-web-user/v1/gallery/auth/eui-me          → 200
+GET  /open-web-user/v1/gallery/auth/me              → 200 {"accountId":...,"user":null}
+GET  /open-web-user/v1/gallery/auth/oauth/links     → 200 已绑定 uniPortal
+GET  /open-web-user/v1/gallery/me/works             → 200 作品列表
+GET  /open-web-user/v1/gallery/me/signature-status  → 200
+```
+
+### 现在只剩两个门槛
+
+| 环节 | 状态 |
+|---|---|
+| 展览馆 eui 登录 | ✅ 已打通 |
+| uniPortal（华为云账号）绑定 | ✅ 已打通，账号已自动创建 |
+| `me/works` 查作品 | ✅ 已通，当前 0 个作品 |
+| **发布作品（open-api-public/works）** | ❌ 仍需 STS 临时凭证 |
+| **可发布的真实项目** | ❌ 没有 |
+
+发布接口的鉴权与上面这套 cookie/eui 体系**完全无关**，它只认
+`X-Tmp-Ak / X-Tmp-Sk / X-Security-Token`（STS 最小权限临时凭证），
+必须用永久 AK/SK + IAM 自委托生成。
+
+---
+
+## 第二轮结论（已修正，保留作对照）
+
+第二轮结论被本轮推翻的部分：*「uniPortal 是独立账号体系，用华为云账号
+登录报 Incorrect account name or password」* —— 那是因为走的是
+**密码登录页**（`login-pc.html#/passwordLogin`），那里确实不认华为云账号。
+正确入口是 `/uniportal1/oauth2/hwid`（华为云 OAuth 跳转）。
+
+---
+
+## 第二轮实测记录（历史）
 
 ### ✅ 突破 1：展览馆登录可以成功
 
