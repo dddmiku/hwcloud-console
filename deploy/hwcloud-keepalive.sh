@@ -4,13 +4,23 @@
 #   脚本是「逐账号/逐步骤容错」的 —— 单个账号或单个任务失败只记录并跳过，
 #   其余继续。加 -e 会让第一个失败就中止整轮，后面全白等。
 #   真正的失败靠显式 if / exit code 处理，不用 -e 兜。
-# 会话保活：每小时跑一次，让 SSO 用 refresh token 重建 ECO_CN_ID。
+# 会话保活（**已默认停用**，仅在明确需要时手动启用）
 #
-# 背景：ECO_CN_ID（.huaweicloud.com 的会话 cookie）只活 1 小时，过期后
-# devdata 的所有接口都返回 404。但它可以纯协议重建——访问 grow 页就会
-# 被 SSO 重新签发，不需要浏览器、不触发验证码。
+# ⚠️ 2026-11-08 起 hwcloud-keepalive.timer 默认 **disabled**。
 #
-# 失败时写一个显式标记文件，方便一眼看出「需要人工在本机重新登录」。
+# 为什么停用：这个定时器每 20 分钟跑一次 keepalive，以前 CLI 的
+# --auto-login 默认是 true，于是会话一失效就会拉 Camoufox 有头浏览器
+# 登录 —— 一天几十次，出口 IP 很快被华为云/GitCode 限流
+# （实测 2026-11-08 展览馆 eui-login 直接 429「登录尝试过于频繁」）。
+#
+# 现在的原则：**按需登录**。
+#   - 用户点任务 → 面板 ensureAlive 检查，离线才登录一次
+#   - 用户点「保活」按钮 → 才跑 keepalive
+#   - 后台不再有定时保活
+#
+# 纯协议续期（不拉浏览器）其实很便宜，需要恢复的话：
+#   systemctl enable --now hwcloud-keepalive.timer
+# 注意此时请确认 CLI 用 `keepalive`（不带 --auto-login），不要自动登录。
 set -uo pipefail
 
 export HWCLOUD_HOME=/opt/hwcloud-demo

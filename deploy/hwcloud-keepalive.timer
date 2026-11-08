@@ -1,6 +1,21 @@
 [Unit]
 Description=hwcloud session keepalive (refresh ECO_CN_ID via SSO)
 
+# ⚠️ 2026-11-08 起默认不安装/不启用（WantedBy 已移除）。
+#
+# 为什么：每 20 分钟一次的定时保活 + CLI 的 --auto-login 默认 true，
+# 会在会话失效时反复拉起 Camoufox 有头浏览器登录，一天几十次，
+# 出口 IP 很快被华为云 / GitCode 限流
+# （实测 2026-11-08 展览馆 eui-login 直接 429「登录尝试过于频繁」）。
+#
+# 现在改成「按需登录」：只有用户点任务/按钮时，面板的 ensureAlive
+# 才会检查会话并在离线时登录一次。
+#
+# 需要恢复定时保活时：
+#   systemctl enable --now hwcloud-keepalive.timer
+# 并确认 hwcloud-keepalive.sh 里调的是 `keepalive`（不带 --auto-login），
+# 这样只做纯协议续期，不会拉浏览器。
+
 [Timer]
 # ECO_CN_ID 只有 1 小时寿命，每 20 分钟刷一次留足余量
 OnCalendar=*:0/20
@@ -8,4 +23,7 @@ Persistent=true
 RandomizedDelaySec=60
 
 [Install]
-WantedBy=timers.target
+# 故意留空：不再默认 WantedBy=timers.target。
+# 留空后 `systemctl enable hwcloud-keepalive.timer` 仍可显式启用
+# （systemd 允许无 [Install] 的单元被 enable 时手动指定），
+# 但安装脚本/镜像不会自动把它挂上。

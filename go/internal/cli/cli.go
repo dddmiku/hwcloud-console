@@ -781,7 +781,13 @@ func Main(args []string) int {
 		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 		headless := fs.Bool("headless", true, "无头模式")
 		minRemain := fs.Float64("min-remain", 0, "剩余小时数低于此值时强制刷新（0=仅失效时刷新）")
-		autoLogin := fs.Bool("auto-login", true, "会话失效时用账号密码自动登录（需要已保存密码）")
+		// 默认不自动登录：keepalive 命令只做纯协议续期，不拉浏览器。
+		//
+		// 为什么改默认值：auto-login 会走 Camoufox（有头浏览器 + 可能过滑块），
+		// 每次消耗出口 IP 配额。定时脚本里如果默认开启，每轮都会尝试登录，
+		// 很快撞上华为云限流（2026-11-08 实测展览馆 eui-login 429）。
+		// 需要自动登录时显式传 --auto-login。
+		autoLogin := fs.Bool("auto-login", false, "会话失效时用账号密码自动登录（默认关闭，需显式传 --auto-login）")
 		if err := fs.Parse(rest); err != nil {
 			return 2
 		}

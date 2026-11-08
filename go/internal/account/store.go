@@ -380,10 +380,17 @@ func MaskPhone(p string) string {
 }
 
 // MaskedPhone 返回账号的脱敏手机号。
-// AutoKeepAliveOn 返回是否允许自动账密登录，默认 true。
+// AutoKeepAliveOn 返回是否允许自动账密登录，默认 true（允许）。
+//
+// 语义是「用户点任务/按钮发现离线时，是否允许自动账密登录」，
+// **不是**「后台定时保活」——后台保活由 systemd 定时器决定，
+// 现在已默认不安装/不启用（见 deploy/hwcloud-keepalive.sh 的说明）。
+//
+// 如需彻底禁止某账号自动登录（例如开了双重验证、每次都会卡在等短信），
+// 在面板上把该账号的自动保活关掉即可。
 //
 // 字段是指针：老账号的 account.json 里没有这一项，读出来是 nil，
-// 这里按 true 处理，行为和加开关之前完全一致。
+// 这里按 true 处理，行为和加开关之前一致。
 func (a *Account) AutoKeepAliveOn() bool {
 	if a.AutoKeepAlive == nil {
 		return true
