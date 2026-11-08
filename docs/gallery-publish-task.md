@@ -54,7 +54,90 @@
 - 成功后服务端**即时代为领取成长积分**，结果在响应 `data.reward` 返回
 - **当月重复领取仍返回 `is_success: true` 但不发分** —— 无法从响应判断
 
-## 实测结论（全部 Observed）
+## 实测结论（2026-11-08，第二轮，全部 Observed）
+
+第二轮做了更深入的探测，**确认了 3 个新事实，也确认了一个新的硬阻塞**：
+
+### ✅ 突破 1：展览馆登录可以成功
+
+之前 429 是因为**直接 fetch `eui-login` 太频繁**。让页面自己触发就成功：
+
+```
+[REQ]  POST /open-web-guest/v1/gallery/auth/eui-login
+[RESP 200] {"data":{},"message":"成功","success":true}
+[RESP 200] /open-web-user/v1/gallery/auth/eui-me
+    {"data":{"id":"007fdca97272a000","nickName":"hw...","domainIdMasked":"06***c0",
+             "isTeacher":false,"isStudent":false}}
+```
+
+**关键**：`eui-login` 是「用华为云会话静默换取展览馆登录态」，
+成功后只在**当前浏览器上下文**里有效（换 context 就没了），
+所以必须**同一个浏览器会话内完成登录 → 发布**，不能分两次跑。
+
+限流是按出口 IP 计（服务器固定 IP `124.71.113.188`），
+冷却窗口约 **60~90 秒**（实测等 90 秒后成功）。
+
+### ✅ 突破 2：`bind/start` 能拿到授权 URL（之前被 CSRF 挡住了）
+
+之前直接 POST 报 `403 CSRF 校验失败`。前端代码里写得很清楚：
+
+```js
+// api.js 的非 GET 请求统一加：
+const csrf = cookie('__Host-bp_csrf') || cookie('bp_csrf');
+headers['x-csrf-token'] = csrf;
+```
+
+补上这个头后成功：
+
+```json
+{"success":true,"data":{
+  "authorizeUrl":"https://uniportal.huawei.com/saaslogin1/oauth2/authorize?client_id=f7358fb0-...",
+  "state":"5ced0be2-..."}}
+```
+
+### ❌ 硬阻塞：uniPortal 是独立账号体系，不是华为云账号
+
+授权页跳到了 `uniportal.huawei.com/uniportal1/login-pc.html`，表单是：
+`#username` / `#password` / `#login-btn`，标题「Sign In with Uniportal ID」。
+
+用华为云手机号 + 密码试了一次：
+
+```
+Incorrect account name or password, you can try 4 times
+```
+
+**uniPortal 是华为内部的 W3 账号体系，和华为云账号不通用。**
+页面上的「Use another account to log in」只是文本，没有可点的替代登录入口。
+
+### 结论
+
+| 环节 | 状态 |
+|---|---|
+| 展览馆 eui 登录 | ✅ 可自动化（同会话内，等限流冷却） |
+| `bind/start` 拿授权 URL | ✅ 可自动化（补 `x-csrf-token`） |
+| uniPortal 授权 | ❌ **需要 W3 账号**，不是华为云账号 |
+| `open-api-public/works` | ❌ 需要 STS（AK/SK + 自委托），服务器没有 |
+| 可发布的真实项目 | ❌ 没有 |
+
+**卡点从「展览馆登录」转移到了「uniPortal 账号」**。即便拿到 uniPortal 账号完成
+GitCode 绑定，发布仍需 STS 临时凭证。
+
+## 一个关键侧面发现
+
+`my-works` 带 CSRF 后仍返回：
+
+```json
+{"success":false,"code":"not_authenticated","reason":"请先登录"}
+```
+
+而同一个会话里 `eui-me` 是 200。说明展览馆有**两套会话**：
+- `eui-*`（华为云 EIAM 通道）→ `eui-me` 能过
+- `open-web-user` 的业务会话（`my-works` / `oauth/links` 用）→ 需要 uniPortal 授权后才有
+
+所以 `oauth/links` 返回 `{"success":true,"data":[]}`（空数组）不是错误，
+就是「还没绑定任何 OAuth 账号」。
+
+## 原探测记录（第一轮）
 
 | 探测项 | 结果 |
 |---|---|
