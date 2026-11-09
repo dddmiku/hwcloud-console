@@ -46,7 +46,18 @@
   </header>
 
   <div class="card">
-    <h2>账号 <span class="badge" id="accCount">0</span></h2>
+    <h2>
+      账号 <span class="badge" id="accCount">0</span>
+      <span class="spacer"></span>
+      <!-- 全部账号批量执行：一次点，后端串行跑完所有账号。
+           为什么放这里而不是每个卡片里：账号多了以后逐张卡片点太累，
+           而且中途容易漏。串行执行由后端保证，前端只轮询一个 job。 -->
+      <span class="act-label">全部账号</span>
+      <button class="btn sm" data-call="runAll" data-arg="keepalive">保活</button>
+      <button class="btn sm primary" data-call="runAll" data-arg="daily">一键日常</button>
+      <button class="btn sm primary" data-call="runAll" data-arg="weekly">一键周常</button>
+      <button class="btn sm primary" data-call="runAll" data-arg="gallery-publish">一键月度</button>
+    </h2>
     <div id="accList"><div class="empty">加载中…</div></div>
     <div class="msg" id="globalMsg"></div>
   </div>

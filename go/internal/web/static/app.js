@@ -549,6 +549,7 @@ const DATA_CALL = {
   hideVnc, copyVncTunnel, copyVncPass,
   probeBindState,
   loadLabs,
+  runAll,
   loadLogRefresh: () => loadLog(currentLog),
   loadLogTab: (el) => {
     const name = el.dataset.log;
@@ -1161,6 +1162,50 @@ const TASK_LABELS = {
 // 这里在前端按「账号+任务」加锁，按钮变灰并显示进度。
 const runningTasks = new Set();
 
+// runAll 触发「全部账号」批量任务（面板账号卡片右上角的四个按钮）。
+//
+// 后端用一个虚拟账号 id=all 遍历所有账号串行执行，前端只轮询一个 job。
+// 批量的串行、防风控间隔、单账号 panic 隔离都在后端做，前端不参与调度。
+async function runAll(el){
+  const name = el && el.dataset ? el.dataset.arg : '';
+  if(!name) return;
+  const label = TASK_LABELS[name] || name;
+  const key = 'all:' + name;
+  if(runningTasks.has(key)){
+    showMsg('globalMsg', '全部账号 · ' + label + ' 正在执行中，请等待完成…', false);
+    return;
+  }
+  runningTasks.add(key);
+  el.disabled = true;
+
+  const started = Date.now();
+  const tick = setInterval(() => {
+    const s = Math.round((Date.now() - started) / 1000);
+    showMsg('globalMsg', '全部账号 · ' + label + ' 执行中… 已用 ' + s + ' 秒', true);
+  }, 1000);
+
+  try{
+    const r = await api('/api/accounts/run?id=all&name=' + encodeURIComponent(name), {method:'POST'});
+    if(r.error){
+      showMsg('globalMsg', '全部账号 · ' + label + ' 失败: ' + r.error, false);
+      return;
+    }
+    if(r.async && r.job){
+      showMsg('globalMsg', r.msg || ('全部账号 · ' + label + ' 已在后台执行'), true);
+      switchLog('service.log');
+      pollJob(r.job.id, r.job.label);
+      return;
+    }
+    showMsg('globalMsg', '全部账号 · ' + label + ' 已提交', true);
+  }catch(e){
+    showMsg('globalMsg', '全部账号 · ' + label + ' 请求异常: ' + (e && e.message ? e.message : e), false);
+  }finally{
+    clearInterval(tick);
+    runningTasks.delete(key);
+    el.disabled = false;
+  }
+}
+
 async function runTask(id, name){
   const label = TASK_LABELS[name] || name;
   const key = id + ':' + name;
@@ -1304,6 +1349,12 @@ function pollJob(jobId, label){
         const steps = j.result.steps;
         const lines = steps.map(st => (st.ok ? '✓ ' : '✗ ') + st.name + '：' + (st.msg || ''));
         showMsg('globalMsg', label + ' ' + j.result.msg + '　' + lines.join('　'), j.result.ok);
+      }else if(j.result && j.result.accounts){
+        // 批量任务：每个账号一行结果。
+        const lines = j.result.lines || [];
+        showMsg('globalMsg',
+          label + ' ' + (j.result.msg || '') + (lines.length ? '　' + lines.join('　') : ''),
+          j.result.ok);
       }else{
         showMsg('globalMsg', label + ' 完成（' + elapsed + ' 秒）', true);
       }

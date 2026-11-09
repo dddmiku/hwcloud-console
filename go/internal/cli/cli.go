@@ -53,6 +53,7 @@ func usage() {
   star           给实践中心仓库点 Star（自动挑未 star 的）
   eventjoin      报名一个进行中的开发者活动
   gallery-publish 作品展览馆发布作品（AI 随机选题，每月一次 +200）
+  all            全部账号批量执行（all daily|weekly|gallery-publish|keepalive）
 `)
 }
 
@@ -654,6 +655,34 @@ func Main(args []string) int {
 		// 一键周常：云实验 + 提Issue + Star仓库 + 活动 + 赛事 + 鸿蒙云端实践。
 		// 同样重定向 stdout，理由见上面 daily 分支的注释。
 		result := runWithStdoutToStderr(web.RunWeeklyForCLI)
+		printJSON(result)
+		if e, ok := result["error"].(string); ok && e != "" {
+			return 1
+		}
+		if ok, _ := result["ok"].(bool); !ok {
+			return 1
+		}
+		return 0
+
+	case "all":
+		// 全部账号批量执行：all <daily|weekly|gallery-publish|keepalive>。
+		//
+		// 面板账号卡片右上角的「全部账号」按钮和这里是同一份逻辑
+		// （web.RunBatchForCLI / startBatchJob 共用），定时脚本也走这个。
+		//
+		// 串行执行 + 账号间留间隔，理由见 startBatchJob 的注释。
+		if len(rest) < 1 {
+			return fail(fmt.Errorf("用法: hwcloud all <daily|weekly|gallery-publish|keepalive>"))
+		}
+		taskName := rest[0]
+		switch taskName {
+		case "daily", "weekly", "gallery-publish", "keepalive":
+		default:
+			return fail(fmt.Errorf("不支持的批量任务: %s（仅支持 daily / weekly / gallery-publish / keepalive）", taskName))
+		}
+		result := runWithStdoutToStderr(func() map[string]any {
+			return web.RunBatchForCLI(taskName)
+		})
 		printJSON(result)
 		if e, ok := result["error"].(string); ok && e != "" {
 			return 1

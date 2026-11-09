@@ -1261,6 +1261,234 @@ func (s *Server) finishJob(jobID string, res map[string]any, errMsg string) {
 	svcLog("[job] %s 结束（%s）", jobID, time.Since(j.Started).Round(time.Second))
 }
 
+// batchAllID 是「全部账号」的虚拟账号 ID。
+//
+// 面板上的「一键日常 / 一键周常 / 一键月度任务」按钮用它作为 id，
+// 后端遍历 store 里的所有账号串行执行。用虚拟 ID 而不是新增接口的理由：
+// 前端只需要把 id 换成 "all"，其余（job 轮询、日志、按钮禁用）完全复用。
+const batchAllID = "all"
+
+// startBatchJob 对所有账号串行执行同一个任务。
+//
+// 为什么串行而不是并发：
+//   - 每个任务都要独占一个 Playwright 浏览器 profile，并发会抢资源
+//     （实测 4 个号同时跑，内存打满、CDP 连接超时）；
+//   - 华为云有账号风控，同一 IP 短时间多账号并发操作更容易触发；
+//   - 串行失败好定位：日志里能看清是哪个号在第几步挂的。
+//
+// 为什么不让前端循环调 startJob：
+//   前端循环只能点一个等一个，中途刷新页面就丢了；而且每个账号
+//   各占一个 job 条目，20 条上限一满就互相挤掉。这里合成一个 job，
+//   进度写进 Step，结果按账号聚合。
+func (s *Server) startBatchJob(name string) (*jobState, error) {
+	s.jobMu.Lock()
+	for _, j := range s.jobs {
+		if j.Account == batchAllID && j.Name == name && j.Running {
+			cp := *j
+			s.jobMu.Unlock()
+			return &cp, fmt.Errorf("「全部账号 · %s」已在执行中（已运行 %s）",
+				taskLabel(name), time.Since(j.Started).Round(time.Second))
+		}
+	}
+
+	jobID := fmt.Sprintf("all-%s-%d", name, time.Now().UnixNano())
+	j := &jobState{
+		ID:      jobID,
+		Account: batchAllID,
+		Name:    name,
+		Label:   "全部 · " + taskLabel(name),
+		Running: true,
+		Step:    "准备中",
+		Started: time.Now(),
+	}
+	s.jobs[jobID] = j
+	if len(s.jobs) > 20 {
+		var oldest string
+		var oldestAt time.Time
+		for k, v := range s.jobs {
+			if v.Running {
+				continue
+			}
+			if oldest == "" || v.Started.Before(oldestAt) {
+				oldest, oldestAt = k, v.Started
+			}
+		}
+		if oldest != "" {
+			delete(s.jobs, oldest)
+		}
+	}
+	cp := *j
+	s.jobMu.Unlock()
+
+	go func() {
+		svcLog("[batch] %s 启动「全部账号 · %s」", jobID, taskLabel(name))
+
+		list := s.store.List()
+		if len(list) == 0 {
+			s.finishJob(jobID, map[string]any{
+				"label": "全部 · " + taskLabel(name),
+				"ok":    false,
+				"msg":   "没有账号",
+			}, "没有账号")
+			return
+		}
+
+		// 按账号聚合结果，最后一次性写进 job.Result。
+		type acctResult struct {
+			ID     string   `json:"id"`
+			Remark string   `json:"remark,omitempty"`
+			OK     bool     `json:"ok"`
+			Msg    string   `json:"msg"`
+			Steps  []string `json:"steps,omitempty"`
+		}
+		results := make([]acctResult, 0, len(list))
+		succeeded := 0
+
+		for idx, acc := range list {
+			label := acc.ID
+			if acc.Remark != "" {
+				label = acc.Remark + "(" + acc.ID + ")"
+			}
+			stepMsg := fmt.Sprintf("[%d/%d] %s 执行中…", idx+1, len(list), label)
+			s.setJobStep(jobID, stepMsg)
+			svcLog("[batch] %s %s", jobID, stepMsg)
+
+			ar := acctResult{ID: acc.ID, Remark: acc.Remark}
+
+			// 每个账号包一层 recover：一个号 panic 不能拖垮整批。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ar.OK = false
+						ar.Msg = fmt.Sprintf("内部错误: %v", r)
+						svcLog("[batch] %s %s panic: %v", jobID, label, r)
+					}
+				}()
+
+				// 会话检查放在 withAccount 之外（withAccount 持有 s.mu，
+				// 而 ensureAlive 内部也可能要拿锁，会自锁死）。
+				if ok, msg := s.ensureAlive(acc.ID, "批量「"+taskLabel(name)+"」时发现离线"); !ok {
+					ar.OK = false
+					ar.Msg = "账号离线：" + msg
+					return
+				}
+
+				var res map[string]any
+				switch name {
+				case "keepalive":
+					// 保活必须在锁外跑（见 handleRunTask 的说明）。
+					// 这里已经 ensureAlive 过了，直接标记成功即可。
+					ar.OK = true
+					ar.Msg = "会话已就绪"
+					return
+				case "gallery-publish":
+					res = s.withAccount(acc.ID, func() any {
+						r, e := task.RunGalleryPublish(task.GalleryOptions{})
+						if e != nil {
+							return map[string]any{"error": e.Error()}
+						}
+						return map[string]any{
+							"ok":    true,
+							"msg":   "作品已发布：" + r.WorkName,
+							"steps": []map[string]any{{"name": "作品发布", "ok": true,
+								"msg": r.WorkURL, "detail": r}},
+						}
+					}).(map[string]any)
+				default:
+					// daily / weekly 走和单个账号完全相同的实现。
+					res = s.withAccount(acc.ID, func() any {
+						switch name {
+						case "daily":
+							return s.runDaily()
+						case "weekly":
+							return s.runWeekly()
+						}
+						return map[string]any{"error": "不支持的批量任务: " + name}
+					}).(map[string]any)
+				}
+
+				if e, ok := res["error"].(string); ok && e != "" {
+					ar.OK = false
+					ar.Msg = e
+					return
+				}
+				ar.OK, _ = res["ok"].(bool)
+				ar.Msg, _ = res["msg"].(string)
+				if steps, ok := res["steps"].([]map[string]any); ok {
+					for _, st := range steps {
+						nm, _ := st["name"].(string)
+						sm, _ := st["msg"].(string)
+						okv, _ := st["ok"].(bool)
+						mark := "✓"
+						if !okv {
+							mark = "✗"
+						}
+						ar.Steps = append(ar.Steps, mark+" "+nm+"："+sm)
+					}
+				}
+			}()
+
+			if ar.OK {
+				succeeded++
+			}
+			results = append(results, ar)
+
+			svcLog("[batch] %s %s → ok=%v %s", jobID, label, ar.OK, clipStr(ar.Msg, 120))
+			// 账号之间留间隔，避免连续请求触发风控。保活很快，间隔小一点。
+			if idx < len(list)-1 {
+				gap := 8 * time.Second
+				if name == "keepalive" {
+					gap = 3 * time.Second
+				}
+				for i := 0; i < int(gap/time.Second); i++ {
+					s.setJobStep(jobID, fmt.Sprintf("[%d/%d] %s ✓ 完成，%d 秒后继续…",
+						idx+1, len(list), label, int(gap/time.Second)-i))
+					time.Sleep(time.Second)
+				}
+			}
+		}
+
+		summary := fmt.Sprintf("成功 %d，失败 %d", succeeded, len(results)-succeeded)
+		var lines []string
+		for _, r := range results {
+			l := r.ID
+			if r.Remark != "" {
+				l = r.Remark
+			}
+			mark := "✓"
+			if !r.OK {
+				mark = "✗"
+			}
+			lines = append(lines, mark+" "+l+"："+clipStr(r.Msg, 80))
+		}
+		s.finishJob(jobID, map[string]any{
+			"label":   "全部 · " + taskLabel(name),
+			"ok":      succeeded == len(results),
+			"msg":     summary,
+			"accounts": results,
+			"lines":   lines,
+		}, func() string {
+			if succeeded == len(results) {
+				return ""
+			}
+			return summary
+		}())
+		svcLog("[batch] %s 结束：%s", jobID, summary)
+	}()
+
+	return &cp, nil
+}
+
+// clipStr 按 rune 截断字符串（避免切坏中文）。
+func clipStr(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+
 // handleJobs 返回最近的任务状态，供前端轮询。
 //
 // 可选 ?id=<jobID> 只查单个。
@@ -1339,6 +1567,33 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	if id == "" || name == "" {
 		http.Error(w, "missing id or name", 400)
 		return
+	}
+
+	// 全部账号批量执行：id=all。
+	//
+	// 只允许长任务批次（daily/weekly/gallery-publish/keepalive）。
+	// 单步任务（签到、Star 等）批量做没有意义 —— 一键任务里已经包含，
+	// 而且重复点容易触发风控。
+	if id == batchAllID {
+		switch name {
+		case "daily", "weekly", "gallery-publish", "keepalive":
+			job, err := s.startBatchJob(name)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, map[string]any{
+				"async": true,
+				"job":   job,
+				"msg":   "全部账号 · " + taskLabel(name) + " 已在后台执行，可在日志区查看进度",
+			})
+			return
+		default:
+			writeJSON(w, map[string]any{
+				"error": "不支持批量执行的任务: " + name + "（仅支持 daily / weekly / gallery-publish / keepalive）",
+			})
+			return
+		}
 	}
 
 	acc, ok := s.store.Get(id)
@@ -3163,6 +3418,127 @@ func RunWeeklyForCLI() map[string]any {
 		return map[string]any{"error": err.Error()}
 	}
 	return s.runWeekly()
+}
+
+// RunBatchForCLI 对全部账号串行执行一个任务，供命令行/定时任务调用。
+//
+// name 取值：daily / weekly / gallery-publish / keepalive。
+//
+// 和面板「全部账号」按钮走同一套逻辑，区别只在出口：
+// 面板把结果写进 job 供前端轮询，这里直接返回聚合结果。
+//
+// 为什么 CLI 也要有：定时任务（hwcloud-daily.sh）是 shell 调 CLI 跑的，
+// 面板按钮和定时脚本不能各写一套批量逻辑 —— 那样迟早不同步
+// （历史上 runDaily 加了鸿蒙任务、脚本没跟着改，就漏跑过一整轮）。
+func RunBatchForCLI(name string) map[string]any {
+	s, err := NewServer("")
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	list := s.store.List()
+	if len(list) == 0 {
+		return map[string]any{"error": "没有账号"}
+	}
+
+	type acctResult struct {
+		ID     string   `json:"id"`
+		Remark string   `json:"remark,omitempty"`
+		OK     bool     `json:"ok"`
+		Msg    string   `json:"msg"`
+		Steps  []string `json:"steps,omitempty"`
+	}
+	results := make([]acctResult, 0, len(list))
+	succeeded := 0
+
+	for i, acc := range list {
+		label := acc.ID
+		if acc.Remark != "" {
+			label = acc.Remark + "(" + acc.ID + ")"
+		}
+		svcLog("[batch-cli] [%d/%d] %s 执行中…", i+1, len(list), label)
+
+		ar := acctResult{ID: acc.ID, Remark: acc.Remark}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ar.OK = false
+					ar.Msg = fmt.Sprintf("内部错误: %v", r)
+				}
+			}()
+
+			if ok, msg := s.ensureAlive(acc.ID, "批量「"+taskLabel(name)+"」时发现离线"); !ok {
+				ar.OK = false
+				ar.Msg = "账号离线：" + msg
+				return
+			}
+
+			if name == "keepalive" {
+				ar.OK = true
+				ar.Msg = "会话已就绪"
+				return
+			}
+
+			res := s.withAccount(acc.ID, func() any {
+				switch name {
+				case "daily":
+					return s.runDaily()
+				case "weekly":
+					return s.runWeekly()
+				case "gallery-publish":
+					r, e := task.RunGalleryPublish(task.GalleryOptions{})
+					if e != nil {
+						return map[string]any{"error": e.Error()}
+					}
+					return map[string]any{
+						"ok":    true,
+						"msg":   "作品已发布：" + r.WorkName,
+						"steps": []map[string]any{{"name": "作品发布", "ok": true, "msg": r.WorkURL}},
+					}
+				}
+				return map[string]any{"error": "不支持的批量任务: " + name}
+			}).(map[string]any)
+
+			if e, ok := res["error"].(string); ok && e != "" {
+				ar.OK = false
+				ar.Msg = e
+				return
+			}
+			ar.OK, _ = res["ok"].(bool)
+			ar.Msg, _ = res["msg"].(string)
+			if steps, ok := res["steps"].([]map[string]any); ok {
+				for _, st := range steps {
+					nm, _ := st["name"].(string)
+					sm, _ := st["msg"].(string)
+					okv, _ := st["ok"].(bool)
+					mark := "✓"
+					if !okv {
+						mark = "✗"
+					}
+					ar.Steps = append(ar.Steps, mark+" "+nm+"："+sm)
+				}
+			}
+		}()
+
+		if ar.OK {
+			succeeded++
+		}
+		results = append(results, ar)
+		svcLog("[batch-cli] %s → ok=%v %s", label, ar.OK, clipStr(ar.Msg, 100))
+
+		if i < len(list)-1 {
+			gap := 8
+			if name == "keepalive" {
+				gap = 3
+			}
+			time.Sleep(time.Duration(gap) * time.Second)
+		}
+	}
+
+	return map[string]any{
+		"ok":       succeeded == len(results),
+		"msg":      fmt.Sprintf("全部账号 · %s：成功 %d，失败 %d", taskLabel(name), succeeded, len(results)-succeeded),
+		"accounts": results,
+	}
 }
 
 // runHarmonyStarBrowserWithRelogin 浏览器版 Star，GitCode 会话失效时自动重登一次。
