@@ -1076,6 +1076,8 @@ func taskLabel(name string) string {
 		return "一键周常"
 	case "cloud-practice":
 		return "鸿蒙云端实践"
+	case "gallery-publish":
+		return "展览馆发布"
 	case "harmony-daily":
 		return "鸿蒙浏览"
 	case "harmony-star-run":
@@ -1192,6 +1194,25 @@ func (s *Server) startJob(id, name string) (*jobState, error) {
 						"ok":    ok,
 						"msg":   msg,
 						"steps": []map[string]any{{"name": "云端实践", "ok": ok, "msg": msg, "detail": out}},
+					}
+				case "gallery-publish":
+					// 作品展览馆发布（每月一次，+200）。全流程走 AI DevSpace 对话，
+					// 包含 AI 生成项目（10~30 分钟）+ GitCode 授权 + 发布。
+					res, err := task.RunGalleryPublish(task.GalleryOptions{})
+					if err != nil {
+						return map[string]any{
+							"label": taskLabel(name),
+							"ok":    false,
+							"msg":   err.Error(),
+							"steps": []map[string]any{{"name": "作品发布", "ok": false, "msg": err.Error()}},
+						}
+					}
+					return map[string]any{
+						"label": taskLabel(name),
+						"ok":    true,
+						"msg":   "作品已发布，+200 积分",
+						"steps": []map[string]any{{"name": "作品发布", "ok": true,
+							"msg": res.WorkName + " → " + res.WorkURL, "detail": res}},
 					}
 				default:
 					return s.runWeekly()
@@ -1329,10 +1350,10 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	startAt := time.Now()
 	svcLog("[run] %s 请求「%s」", id, taskLabel(name))
 
-	// 长任务（日常/周常）走异步：同步跑要几分钟，HTTP 会超时，
-	// 前端表现就是「点了没反应」。这里立即返回 job id，后台执行，
-	// 前端轮询 /api/jobs 看进度。
-	if name == "daily" || name == "weekly" || name == "cloud-practice" {
+	// 长任务（日常/周常/作品发布）走异步：同步跑要几分钟到几十分钟，
+	// HTTP 会超时，前端表现就是「点了没反应」。这里立即返回 job id，
+	// 后台执行，前端轮询 /api/jobs 看进度。
+	if name == "daily" || name == "weekly" || name == "cloud-practice" || name == "gallery-publish" {
 		job, err := s.startJob(id, name)
 		if err != nil {
 			writeJSON(w, map[string]any{"error": err.Error()})
@@ -1864,6 +1885,16 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 
 		case "weekly":
 			return s.runWeekly()
+
+		case "gallery-publish":
+			// 作品展览馆发布（每月一次，+200 积分）。
+			// 全流程走 AI DevSpace 对话：生成作品 → 装 skill →
+			// GitCode 授权 → 选活动 → 发布。
+			res, err := task.RunGalleryPublish(task.GalleryOptions{})
+			if err != nil {
+				return map[string]any{"error": err.Error()}
+			}
+			return map[string]any{"ok": true, "msg": "作品已发布", "detail": res}
 
 		default:
 			return map[string]any{"error": "unknown task"}

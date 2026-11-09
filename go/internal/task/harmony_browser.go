@@ -273,6 +273,54 @@ func clickGitcodeStar(page playwright.Page) (before, after string, err error) {
 	return before, after, nil
 }
 
+// gitcodePageLoggedIn 判断当前 GitCode 页面是否处于已登录状态。
+//
+// 判据（任一命中即算已登录，全部不命中算未登录）：
+//   - cookie 里有 GITCODE_ACCESS_TOKEN（最可靠，但页面上下文读不到 httpOnly
+//     时可能为空，所以不能只靠它）
+//   - 页面右上角没有 Login / Register 按钮
+//   - 有用户头像/用户名菜单
+//
+// 反过来只要明确看到 Login 按钮且有 Star 区，就能判定未登录 —— 这个信号
+// 比「读不到 Star 按钮」可靠得多，后者在页面还没渲染完时也会成立。
+func gitcodePageLoggedIn(page playwright.Page) (bool, string) {
+	v, err := page.Evaluate(`() => {
+		const txt = document.body ? (document.body.innerText || '') : '';
+		const btns = [...document.querySelectorAll('a, button, div[role=button]')]
+			.map(e => (e.innerText || '').trim().toLowerCase())
+			.filter(Boolean);
+		const hasLogin = btns.some(t => t === 'login' || t === '登录' || t === 'sign in');
+		const hasRegister = btns.some(t => t === 'register' || t === '注册' || t === 'sign up');
+		const hasStarArea = /star/i.test(txt);
+		const hasUserMenu = !!document.querySelector(
+			'[class*=avatar], [class*=user-menu], [class*=userinfo], [class*=user-info]');
+		return {hasLogin, hasRegister, hasStarArea, hasUserMenu};
+	}`)
+	if err != nil {
+		return true, "页面状态读取失败（按已登录继续，失败会走原有判据）"
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return true, "页面状态格式异常（按已登录继续）"
+	}
+	hasLogin := asBool(m["hasLogin"])
+	hasRegister := asBool(m["hasRegister"])
+	hasStarArea := asBool(m["hasStarArea"])
+	hasUserMenu := asBool(m["hasUserMenu"])
+	if hasUserMenu {
+		return true, ""
+	}
+	if (hasLogin || hasRegister) && hasStarArea {
+		return false, "页面右上角出现 Login/Register 且无用户菜单"
+	}
+	return true, ""
+}
+
+// gitcodeLoginProbeURL 返回用于登录态预检的仓库 URL。
+func gitcodeLoginProbeURL(repoPath string) string {
+	return "https://gitcode.com/" + repoPath
+}
+
 // gitcodeSessionExpired 判断账号的 GitCode 会话是否已过期。
 //
 // 为什么要主动判断、不能靠页面报错：
@@ -430,6 +478,27 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 	page, err := ctx.NewPage()
 	if err != nil {
 		return nil, err
+	}
+
+	// 起手先做一次登录态预检。
+	//
+	// 为什么必须在循环外做：仓库页是公开可读的，未登录时页面照样能打开、
+	// 只是没有 Star 按钮。原来只在「读不到 Star 按钮」时判断一次，但那个
+	// 判据依赖页面文案，漏判就在**每个候选仓库**上重跑一遍 6 秒等待 ——
+	// 40 多个案例仓就是 4 分钟以上纯空转。2026-11-09 实测热情号就是这样
+	// 卡了 13 分钟被 systemd 杀掉：cookie 域是 .atomgit.com，打开
+	// gitcode.com 时是未登录态（右上角 Login/Register）。
+	//
+	// 预检只看一个可靠信号：页面上有 Login/Register（或「登录」）按钮，
+	// 且有 Star 区（说明页面渲染完了）。命中就打过期前缀让上层重登。
+	if _, err := page.Goto(gitcodeLoginProbeURL(cands[0].RepoPath), playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(60000),
+	}); err == nil {
+		page.WaitForTimeout(5000)
+		if logged, why := gitcodePageLoggedIn(page); !logged {
+			return nil, fmt.Errorf("%sGitCode 未登录（%s）", errGitCodeExpired, why)
+		}
 	}
 
 	attempts := []map[string]any{}

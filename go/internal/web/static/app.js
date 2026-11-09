@@ -517,6 +517,10 @@ function renderAccount(a){
         act('run', 'eventjoin', '活动报名') +
       '</div>' +
       '<div class="act-group">' +
+        '<span class="act-label">每月</span>' +
+        act('run', 'gallery-publish', '展览馆发布', 'primary') +
+      '</div>' +
+      '<div class="act-group">' +
         '<span class="act-label">工具</span>' +
         gitcodeBtn(a) +
         act('run', 'harmony-bind', '鸿蒙绑定') +
@@ -1147,6 +1151,7 @@ async function doTrust(){
 const TASK_LABELS = {
   daily: '一键日常', weekly: '一键周常', sign: '签到', devspace: 'DevSpace',
   lab: '云实验', blog: '发文章', issue: '提Issue', star: 'Star', eventjoin: '活动报名', keepalive: '保活',
+  'gallery-publish': '展览馆发布',
 };
 
 // runningTasks 记录正在执行的任务，防止连点。

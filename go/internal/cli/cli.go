@@ -52,6 +52,7 @@ func usage() {
   issue          创建 GitCode Issue
   star           给实践中心仓库点 Star（自动挑未 star 的）
   eventjoin      报名一个进行中的开发者活动
+  gallery-publish 作品展览馆发布作品（AI 随机选题，每月一次 +200）
 `)
 }
 
@@ -876,6 +877,32 @@ func Main(args []string) int {
 		}
 		ensureSession()
 		result, err := task.JoinEvent(*dryRun)
+		if err != nil {
+			return fail(err)
+		}
+		printJSON(result)
+		return 0
+
+	case "gallery-publish":
+		// 作品展览馆发布（每月一次，+200 积分）。
+		//
+		// 和面板「展览馆发布」按钮走同一个 task.RunGalleryPublish。
+		// 加 CLI 入口的原因：面板有登录鉴权，定时/排障时不便从外部 POST；
+		// 而且系统定时任务本来就走 CLI（见 hwcloud-daily.sh）。
+		//
+		// 注意：这是长任务（AI 创作 2-10 分钟 + 发布流程 5-15 分钟），
+		// 调用方要给足超时，不要用默认 120 秒。
+		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+		prompt := fs.String("prompt", "", "创作口令（留空=由 AI 自己随机选题）")
+		timeout := fs.Duration("timeout", 40*time.Minute, "整轮超时")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		ensureSession()
+		result, err := task.RunGalleryPublish(task.GalleryOptions{
+			Prompt:  *prompt,
+			Timeout: *timeout,
+		})
 		if err != nil {
 			return fail(err)
 		}
