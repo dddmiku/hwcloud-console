@@ -1268,6 +1268,108 @@ func (s *Server) finishJob(jobID string, res map[string]any, errMsg string) {
 // 前端只需要把 id 换成 "all"，其余（job 轮询、日志、按钮禁用）完全复用。
 const batchAllID = "all"
 
+// batchMustDo 定义每个批量任务「必须完成的项」。
+//
+// 用途：批量执行前先查该账号的任务状态，**全部命中就整号跳过**，
+// 不再启动浏览器。这和 runDaily 内部的步骤级 skipIfDone 是两层：
+//   - 步骤级：某个子任务已完成就跳过那一步，其余继续
+//   - 账号级：整组都完成就一个浏览器都不开（快得多，也不触发风控）
+//
+// 匹配串来自成长中心的真实任务标题（实测 2026-11-09）。
+// 用 Contains 而不是全等：标题里可能带 emoji 或前后缀变化。
+var batchMustDo = map[string][]string{
+	"daily": {
+		"发布文章",       // 每日发布文章 (+60)
+		"体验AI DevSpace", // 每日体验 AI DevSpace (+30)
+		"浏览一个鸿蒙案例",  // 每日浏览一个鸿蒙案例 (+10)
+		"Star一个鸿蒙案例", // 每日Star一个鸿蒙案例代码仓 (+30)
+	},
+	"weekly": {
+		"实践一个实验",        // 每周实践一个实验 (+50)
+		"Agent开发实践中心代码仓提 Issue", // 每周提 Issue (+60)
+		"Agent开发实践中心代码仓",       // 每周 Star (+50)
+		"参加开发者活动",         // 每周参加开发者活动 (+10)
+	},
+	"gallery-publish": {
+		"在开发者作品展览馆中发布作品", // +200，每月一次
+	},
+}
+
+// accountBatchDone 判断某账号在本轮批量任务里是否「已经全做完」。
+//
+// 返回 (done, 已完成的项数, 总项数, err)。
+// 查询失败或超时都返回 done=false —— 宁可多跑一次，也不要因为读不到状态而漏做。
+//
+// 为什么必须限时：华为云的任务列表接口实测偶发极慢（2026-11-09 批量保活时
+// 3 号卡了 2 分钟，CPU 零增长、多条 ESTAB 挂着）。预检只是「优化」，
+// 不能因为它把整批任务拖住 —— 超时就当查不到，照常执行。
+//
+// 注意：这里只读任务列表，不发任何写请求，可以在锁外调用。
+func (s *Server) accountBatchDone(acctID, name string) (bool, int, int, error) {
+	mustDo, ok := batchMustDo[name]
+	if !ok {
+		return false, 0, 0, nil // 保活没有「完成」概念
+	}
+
+	type queryResult struct {
+		missions []huawei.Mission
+		err      error
+	}
+	ch := make(chan queryResult, 1)
+
+	go func() {
+		var r queryResult
+		defer func() {
+			if rec := recover(); rec != nil {
+				r.err = fmt.Errorf("panicked: %v", rec)
+			}
+			ch <- r
+		}()
+		s.withAccount(acctID, func() any {
+			sess, err := huawei.New("")
+			if err != nil {
+				r.err = err
+				return nil
+			}
+			ms, err := sess.AllMissions()
+			if err != nil {
+				r.err = err
+				return nil
+			}
+			r.missions = ms
+			return nil
+		})
+	}()
+
+	var qr queryResult
+	select {
+	case qr = <-ch:
+	case <-time.After(45 * time.Second):
+		return false, 0, len(mustDo), fmt.Errorf("任务状态查询超时（45s）")
+	}
+	if qr.err != nil {
+		return false, 0, len(mustDo), qr.err
+	}
+
+	doneTitles := map[string]bool{}
+	for _, m := range qr.missions {
+		if m.IsFinish == 1 {
+			doneTitles[m.Title] = true
+		}
+	}
+
+	hit := 0
+	for _, want := range mustDo {
+		for title := range doneTitles {
+			if strings.Contains(title, want) {
+				hit++
+				break
+			}
+		}
+	}
+	return hit >= len(mustDo), hit, len(mustDo), nil
+}
+
 // startBatchJob 对所有账号串行执行同一个任务。
 //
 // 为什么串行而不是并发：
@@ -1367,10 +1469,34 @@ func (s *Server) startBatchJob(name string) (*jobState, error) {
 
 				// 会话检查放在 withAccount 之外（withAccount 持有 s.mu，
 				// 而 ensureAlive 内部也可能要拿锁，会自锁死）。
+				//
+				// 【顺序很重要】保活必须在预检之前：
+				// 预检查任务状态要用 cookie 调接口，会话过期直接 403
+				// （实测 2026-11-09 批量 daily 时热情号就撞上了）。
+				// 保活本身很便宜（会话有效时只做一次 HTTP 检查），
+				// 换来的是预检能正常读到状态、真正省掉整套浏览器流程。
 				if ok, msg := s.ensureAlive(acc.ID, "批量「"+taskLabel(name)+"」时发现离线"); !ok {
 					ar.OK = false
 					ar.Msg = "账号离线：" + msg
 					return
+				}
+
+				// ---------- 账号级预检：本轮任务全做完就整号跳过 ----------
+				//
+				// 会话已经就绪，现在读任务状态才有效。
+				// 如果这个号今天/本周/本月的任务都已经完成，就不再往下跑，
+				// 省掉整套浏览器流程（实测从 30+ 秒降到 1 秒）。
+				if _, hasMustDo := batchMustDo[name]; hasMustDo {
+					done, hit, total, derr := s.accountBatchDone(acc.ID, name)
+					if derr != nil {
+						// 查不到状态不算失败：继续正常执行（宁可多跑不要漏做）
+						svcLog("[batch] %s %s 状态查询失败（继续执行）: %v", jobID, label, derr)
+					} else if done {
+						ar.OK = true
+						ar.Msg = fmt.Sprintf("本轮 %s 已全部完成（%d/%d），跳过", taskLabel(name), hit, total)
+						svcLog("[batch] %s %s %s", jobID, label, ar.Msg)
+						return
+					}
 				}
 
 				var res map[string]any
@@ -3466,10 +3592,25 @@ func RunBatchForCLI(name string) map[string]any {
 				}
 			}()
 
+			// 会话检查必须在预检之前：预检要用 cookie 调接口，
+			// 会话过期会直接 403（同 startBatchJob 的说明）。
 			if ok, msg := s.ensureAlive(acc.ID, "批量「"+taskLabel(name)+"」时发现离线"); !ok {
 				ar.OK = false
 				ar.Msg = "账号离线：" + msg
 				return
+			}
+
+			// 账号级预检：本轮任务全做完就整号跳过（同 startBatchJob）。
+			if _, hasMustDo := batchMustDo[name]; hasMustDo {
+				done, hit, total, derr := s.accountBatchDone(acc.ID, name)
+				if derr != nil {
+					svcLog("[batch-cli] %s 状态查询失败（继续执行）: %v", label, derr)
+				} else if done {
+					ar.OK = true
+					ar.Msg = fmt.Sprintf("本轮 %s 已全部完成（%d/%d），跳过", taskLabel(name), hit, total)
+					svcLog("[batch-cli] %s %s", label, ar.Msg)
+					return
+				}
 			}
 
 			if name == "keepalive" {
