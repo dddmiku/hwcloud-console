@@ -1,0 +1,14 @@
+[Unit]
+Description=hwcloud timer guard (check every 10min)
+
+[Timer]
+# 每 10 分钟检查一次。业务 timer 是每天/每周级别的，
+# 10 分钟的自愈延迟完全够用，也不会给 systemd 造成负担。
+OnCalendar=*:0/10
+# Persistent：机器重启后如果错过了，起来补跑一次
+Persistent=true
+# 加 30 秒随机，避免和其它 timer 同时刻
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

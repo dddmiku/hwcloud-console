@@ -1,0 +1,12 @@
+[Unit]
+Description=hwcloud timer guard (re-enable daily/weekly timers if stopped)
+After=network-online.target
+# 不配 Conflicts=：这个单元要能在其它服务停止时继续跑，
+# 否则会把「停服务连带停 timer」的坑复制一遍。
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hwcloud-timer-guard.sh
+User=root
+# 自愈动作很快（纯 systemctl 调用，几秒），给 60 秒足够
+TimeoutStartSec=60
