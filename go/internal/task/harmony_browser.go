@@ -501,17 +501,43 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 		}
 	}
 
+	// ---------- 遍历候选仓库找未 Star 的 ----------
+	//
+	// 必须设总时长上限。
+	//
+	// 2026-11-14 实测：某账号在 09:44 进入这段循环，10:31 才出来，
+	// 卡了 47 分钟 —— 把整个 daily 窗口（systemd TimeoutStartSec=3600）
+	// 耗尽，后面两个账号直接没跑。
+	//
+	// 原因：候选仓库 40+ 个，每个 goto 超时 60s + 等待 6s，最坏 44 分钟。
+	// 网络稍慢或某些仓库一直超时，就会一路试到底。
+	//
+	// 现在加 12 分钟硬上限并缩短单步超时：正常几个仓库就能找到未 Star 的，
+	// 超时就按「待同步」返回（下次再试），不拖垮其它账号。
+	starDeadline := time.Now().Add(12 * time.Minute)
 	attempts := []map[string]any{}
 	for _, cand := range cands {
+		if time.Now().After(starDeadline) {
+			// 用 Println 而非 Printf：这个文件曾被脚本改坏过一次，
+			// 反斜杠 n 被吞成了真实换行，导致语法错误。Println 天然带换行。
+			fmt.Println("[star] 遍历候选仓库超时，放弃本次 Star，已试个数:", len(attempts))
+			return map[string]any{
+				"task_key":      "gitcode-star",
+				"completed":     false,
+				"pending_check": true,
+				"tried":         attempts,
+				"msg": fmt.Sprintf("遍历 %d 个候选仓库仍未找到可 Star 的（超时 12 分钟），下次再试", len(attempts)),
+			}, nil
+		}
 		repoURL := "https://gitcode.com/" + cand.RepoPath
 		if _, err := page.Goto(repoURL, playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-			Timeout:   playwright.Float(60000),
+			Timeout:   playwright.Float(30000),
 		}); err != nil {
 			attempts = append(attempts, map[string]any{"repo": cand.RepoPath, "skip": "goto: " + err.Error()})
 			continue
 		}
-		page.WaitForTimeout(6000)
+		page.WaitForTimeout(4000)
 		dismissGitcodeGuide(page)
 
 		text, starred := starButtonState(page)

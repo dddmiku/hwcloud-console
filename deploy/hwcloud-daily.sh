@@ -92,8 +92,21 @@ for acc in $(random_accounts); do
     # svcLog 写的是 stderr（进度日志），stdout 只有结果 JSON。
     # 合并的话 JSON 会被日志行冲散，下面 json.load 必然失败 ——
     # 实测日志里全是「(输出非 JSON)」。
-    out=$(HWCLOUD_ACCOUNT="$acc" "$BIN" daily 2>/dev/null)
+    # 单账号限时 20 分钟。
+    #
+    # 为什么必须限时：2026-11-14 实测某账号的鸿蒙 Star 卡了 47 分钟，
+    # 把整个 daily 窗口（systemd TimeoutStartSec=3600）耗尽，systemd 触发
+    # "start operation timed out" 直接 TERM 掉主进程，后面两个账号根本没跑。
+    # 一个账号卡死不该让整批失败 —— 单独限时，超时就把这个号标记失败继续下一个。
+    #
+    # 正常单号 2-8 分钟，20 分钟足够；超时说明真的卡了，标记后由下次补跑。
+    out=$(HWCLOUD_ACCOUNT="$acc" timeout 1200 "$BIN" daily 2>/dev/null)
     rc=$?
+    if [ $rc -eq 124 ]; then
+        log "[$acc] daily 超时（20 分钟），跳过该账号继续下一个"
+        overall=1
+        continue
+    fi
     # 结果是一大坨 JSON，只取 msg 和失败项，避免日志被撑爆
     summary=$(echo "$out" | python3 -c '
 import json,sys

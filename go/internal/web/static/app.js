@@ -187,6 +187,7 @@ function showMain(){
   }
   loadAccounts();
   loadTimers();
+  loadPushConfig();
   loadLog(currentLog);
 }
 
@@ -550,6 +551,7 @@ const DATA_CALL = {
   probeBindState,
   loadLabs,
   runAll,
+  savePush, testPush, clearPushToken,
   loadLogRefresh: () => loadLog(currentLog),
   loadLogTab: (el) => {
     const name = el.dataset.log;
@@ -1751,6 +1753,97 @@ async function saveGitCode(){
 }
 
 // ===== 定时任务 / 日志 =====
+// ===== PushPlus 通知配置 =====
+//
+// token 由用户在面板里自己填，存在服务器 state/pushplus.json。
+// 读取时后端只回掩码（abcd****wxyz），输入框留空表示"不修改"——
+// 所以保存时 token 传空是安全的，不会把已存的清掉；
+// 要清空必须点「清除 Token」（warn 后发 clear_token=true）。
+
+async function loadPushConfig(){
+  try{
+    const d = await api('/api/pushplus');
+    if(d.error){ setPushState('读取失败: ' + d.error, false); return; }
+    $('pushEnabled').checked = !!d.enabled;
+    $('pushEvDone').checked = !!(d.events && d.events.task_done);
+    $('pushEvFail').checked = !!(d.events && d.events.task_fail);
+    $('pushEvLogin').checked = !!(d.events && d.events.login_expired);
+    const tk = $('pushToken');
+    if(d.has_token){
+      tk.value = '';
+      tk.placeholder = '已配置（' + (d.token_masked || '****') + '）留空表示不修改';
+      setPushState('已配置', true);
+    }else{
+      tk.value = '';
+      tk.placeholder = '粘贴 PushPlus token';
+      setPushState('未配置', false);
+    }
+  }catch(e){
+    setPushState('读取失败: ' + e.message, false);
+  }
+}
+
+function setPushState(text, ok){
+  const el = $('pushState');
+  if(!el) return;
+  el.textContent = text;
+  el.className = ok ? 'ok' : 'warn';
+}
+
+function pushPayload(extra){
+  return Object.assign({
+    token: $('pushToken').value.trim(),
+    enabled: $('pushEnabled').checked,
+    events: {
+      task_done: $('pushEvDone').checked,
+      task_fail: $('pushEvFail').checked,
+      login_expired: $('pushEvLogin').checked,
+    },
+  }, extra || {});
+}
+
+async function savePush(){
+  try{
+    const r = await api('/api/pushplus/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(pushPayload()),
+    });
+    if(r.error) return showMsg('pushMsg', '保存失败: ' + r.error, false);
+    showMsg('pushMsg', '已保存', true);
+    loadPushConfig();
+  }catch(e){
+    showMsg('pushMsg', '保存异常: ' + e.message, false);
+  }
+}
+
+async function testPush(){
+  showMsg('pushMsg', '发送中…', true);
+  try{
+    const r = await api('/api/pushplus/test', {method: 'POST'});
+    if(r.error) return showMsg('pushMsg', '测试失败: ' + r.error, false);
+    showMsg('pushMsg', r.msg || '已发送，请查看微信', true);
+  }catch(e){
+    showMsg('pushMsg', '测试异常: ' + e.message, false);
+  }
+}
+
+async function clearPushToken(){
+  if(!confirm('确定要清除已保存的 PushPlus token 吗？清除后不再推送。')) return;
+  try{
+    const r = await api('/api/pushplus/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({clear_token: true}),
+    });
+    if(r.error) return showMsg('pushMsg', '清除失败: ' + r.error, false);
+    showMsg('pushMsg', '已清除 token', true);
+    loadPushConfig();
+  }catch(e){
+    showMsg('pushMsg', '清除异常: ' + e.message, false);
+  }
+}
+
 async function loadTimers(){
   try{
     const d = await api('/api/timers');

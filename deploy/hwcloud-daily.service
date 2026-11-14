@@ -1,0 +1,20 @@
+[Unit]
+Description=hwcloud daily tasks (sign + devspace)
+After=network-online.target
+Wants=network-online.target
+# 与周常互斥：两者都用 Playwright 浏览器和账号 state 目录，
+# 并行会互相踢登录态（实测 2026-11-09 weekly 云端实践超时失败）。
+Conflicts=hwcloud-weekly.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hwcloud-daily.sh
+User=root
+# 4 个账号 × 单号限时 20 分钟 + 每号最多 3 分钟随机延时 ≈ 最坏 92 分钟。
+# 2026-11-14 实测原本的 3600s 不够：单号卡了 47 分钟就把整批挤爆，
+# systemd 触发 "start operation timed out" 直接 TERM，后两个号没跑。
+# 现在脚本内部对单号限时 1200s，这里再给到 7200s 兜底。
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target

@@ -245,6 +245,10 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/timers", guard(s.handleTimers))
 	mux.HandleFunc("/api/logs", guard(s.handleLogs))
 	mux.HandleFunc("/api/system", guard(s.handleSystem))
+	// PushPlus 通知配置（token 由用户在面板自行填写）
+	mux.HandleFunc("/api/pushplus", guard(s.handlePushPlusGet))
+	mux.HandleFunc("/api/pushplus/save", guard(s.handlePushPlusSave))
+	mux.HandleFunc("/api/pushplus/test", guard(s.handlePushPlusTest))
 
 	// API 前缀兜底：未注册的 /api/* 一律 404 JSON，而不是落到根路由返回 HTML。
 	// 放在所有具体路由之后注册，ServeMux 会优先匹配更具体的模式。
@@ -1245,20 +1249,126 @@ func (s *Server) setJobStep(jobID, step string) {
 // finishJob 标记任务结束并写入结果。
 func (s *Server) finishJob(jobID string, res map[string]any, errMsg string) {
 	s.jobMu.Lock()
-	defer s.jobMu.Unlock()
-	j, ok := s.jobs[jobID]
-	if !ok {
+	var notifyInfo *jobNotify
+	if j, ok := s.jobs[jobID]; ok {
+		j.Running = false
+		j.Result = res
+		j.Error = errMsg
+		j.Ended = time.Now()
+		j.Step = "已完成"
+		if errMsg != "" {
+			j.Step = "失败"
+		}
+		svcLog("[job] %s 结束（%s）", jobID, time.Since(j.Started).Round(time.Second))
+		// 先把推送需要的信息拷出来。notify 会发 5 秒超时的 HTTP 请求，
+		// 在 jobMu 里做网络 I/O 会卡住所有 /api/jobs 轮询 ——
+		// 前端立刻表现为「进度条纹丝不动」。
+		notifyInfo = &jobNotify{
+			Label:   j.Label,
+			Account: j.Account,
+			Result:  res,
+			ErrMsg:  errMsg,
+			Elapsed: time.Since(j.Started),
+		}
+	}
+	s.jobMu.Unlock()
+
+	if notifyInfo != nil {
+		go s.notifyJobDone(notifyInfo)
+	}
+}
+
+// jobNotify 是 finishJob 传给推送层的快照。
+type jobNotify struct {
+	Label   string
+	Account string
+	Result  map[string]any
+	ErrMsg  string
+	Elapsed time.Duration
+}
+
+// notifyJobDone 把任务结果整理成人话推送到 PushPlus。
+//
+// 推送是纯附加功能：任何失败都只记日志，绝不影响任务本身的成败判定。
+func (s *Server) notifyJobDone(n *jobNotify) {
+	if n == nil {
 		return
 	}
-	j.Running = false
-	j.Result = res
-	j.Error = errMsg
-	j.Ended = time.Now()
-	j.Step = "已完成"
-	if errMsg != "" {
-		j.Step = "失败"
+	cfg := currentPushConfig()
+	if cfg == nil || !cfg.Enabled || strings.TrimSpace(cfg.Token) == "" {
+		return
 	}
-	svcLog("[job] %s 结束（%s）", jobID, time.Since(j.Started).Round(time.Second))
+
+	status := "成功"
+	event := "task_done"
+	if n.ErrMsg != "" {
+		status = "失败"
+		event = "task_fail"
+	}
+	if event == "task_done" && !cfg.Events.TaskDone {
+		return
+	}
+	if event == "task_fail" && !cfg.Events.TaskFail {
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "任务：%s\n", n.Label)
+	if n.Account != "" {
+		fmt.Fprintf(&b, "账号：%s\n", accountLabelForNotify(s, n.Account))
+	}
+	fmt.Fprintf(&b, "结果：%s\n", status)
+	fmt.Fprintf(&b, "耗时：%s\n", n.Elapsed.Round(time.Second))
+
+	// 逐条步骤 / 逐账号结果
+	if n.Result != nil {
+		if msg, _ := n.Result["msg"].(string); msg != "" {
+			fmt.Fprintf(&b, "摘要：%s\n", msg)
+		}
+		if lines, ok := n.Result["lines"].([]string); ok && len(lines) > 0 {
+			fmt.Fprintf(&b, "\n明细：\n")
+			for _, l := range lines {
+				fmt.Fprintf(&b, "  %s\n", l)
+			}
+		}
+		if steps, ok := n.Result["steps"].([]map[string]any); ok && len(steps) > 0 {
+			fmt.Fprintf(&b, "\n步骤：\n")
+			for _, st := range steps {
+				mark := "✓"
+				if okv, _ := st["ok"].(bool); !okv {
+					mark = "✗"
+				}
+				nm, _ := st["name"].(string)
+				sm, _ := st["msg"].(string)
+				fmt.Fprintf(&b, "  %s %s：%s\n", mark, nm, clipStr(sm, 100))
+			}
+		}
+	}
+	if n.ErrMsg != "" {
+		fmt.Fprintf(&b, "\n错误：%s\n", clipStr(n.ErrMsg, 200))
+	}
+	fmt.Fprintf(&b, "\n时间：%s", time.Now().Format("2006-01-02 15:04:05"))
+
+	title := fmt.Sprintf("【hwcloud】%s %s", n.Label, status)
+	if err := sendPushPlus(cfg.Token, title, b.String(), cfg.Topic); err != nil {
+		svcLog("[pushplus] 推送失败（%s）：%v", event, err)
+		return
+	}
+	svcLog("[pushplus] 已推送（%s）：%s", event, title)
+}
+
+// accountLabelForNotify 把账号 ID 换成「备注(手机号)」，没有备注就用手机号。
+func accountLabelForNotify(s *Server, id string) string {
+	if id == "" || id == batchAllID {
+		return ""
+	}
+	if acc, ok := s.store.Get(id); ok {
+		if acc.Remark != "" {
+			return acc.Remark + "(" + acc.ID + ")"
+		}
+		return acc.ID
+	}
+	return id
 }
 
 // batchAllID 是「全部账号」的虚拟账号 ID。

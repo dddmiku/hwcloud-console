@@ -69,6 +69,63 @@
 
   <div class="card">
     <h2>
+      通知推送
+      <span class="spacer"></span>
+      <span class="hint" style="font-weight:normal">
+        任务跑完推到微信，不用一直盯面板
+      </span>
+    </h2>
+    <div class="sub" style="margin-bottom:12px">
+      使用 <a href="https://www.pushplus.plus" target="_blank" rel="noopener">PushPlus</a>：
+      微信扫码登录后复制 token 填在下面即可。token 只存在本机
+      <code>state/pushplus.json</code>，不会上传到任何地方。
+    </div>
+
+    <div class="item">
+      <span class="k">Token</span>
+      <span style="flex:1">
+        <input type="password" id="pushToken" placeholder="粘贴 PushPlus token"
+               autocomplete="off" spellcheck="false"
+               style="width:100%;max-width:420px;padding:6px 8px">
+      </span>
+    </div>
+    <div class="item">
+      <span class="k">状态</span>
+      <span id="pushState" class="hint">读取中…</span>
+    </div>
+    <div class="item">
+      <span class="k">推送时机</span>
+      <span id="pushEvents">
+        <label style="margin-right:14px">
+          <input type="checkbox" id="pushEvDone" checked> 任务完成
+        </label>
+        <label style="margin-right:14px">
+          <input type="checkbox" id="pushEvFail" checked> 任务失败
+        </label>
+        <label>
+          <input type="checkbox" id="pushEvLogin" checked> 会话失效需重登
+        </label>
+      </span>
+    </div>
+    <div class="item">
+      <span class="k">启用</span>
+      <span>
+        <label>
+          <input type="checkbox" id="pushEnabled" checked> 开启推送
+        </label>
+      </span>
+    </div>
+
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn sm primary" data-call="savePush">保存</button>
+      <button class="btn sm" data-call="testPush">发送测试</button>
+      <button class="btn sm danger" data-call="clearPushToken">清除 Token</button>
+    </div>
+    <div class="msg" id="pushMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>
       可用实验
       <span class="badge" id="labCount">—</span>
       <span class="spacer"></span>
