@@ -1264,6 +1264,7 @@ func (s *Server) finishJob(jobID string, res map[string]any, errMsg string) {
 		// 在 jobMu 里做网络 I/O 会卡住所有 /api/jobs 轮询 ——
 		// 前端立刻表现为「进度条纹丝不动」。
 		notifyInfo = &jobNotify{
+			Name:    j.Name,
 			Label:   j.Label,
 			Account: j.Account,
 			Result:  res,
@@ -1280,6 +1281,7 @@ func (s *Server) finishJob(jobID string, res map[string]any, errMsg string) {
 
 // jobNotify 是 finishJob 传给推送层的快照。
 type jobNotify struct {
+	Name    string // 任务名（daily/weekly/keepalive…），用于决定是否推送
 	Label   string
 	Account string
 	Result  map[string]any
@@ -1294,6 +1296,15 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 	if n == nil {
 		return
 	}
+	// 只通知「产积分」的任务结束。
+	//
+	// 保活、检查、积分查询这类任务不通知：它们一天跑很多次，
+	// 每次都推一条只会变成骚扰。判断依据是 job 名而不是结果内容 ——
+	// 名字来自 startJob/startBatchJob，稳定可控。
+	if !pushWorthyTask(n.Name) {
+		return
+	}
+
 	cfg := currentPushConfig()
 	if cfg == nil || !cfg.Enabled || strings.TrimSpace(cfg.Token) == "" {
 		return
@@ -1312,49 +1323,92 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 		return
 	}
 
+	// 正文只报积分总数 —— 任务细节面板上看得到，推送到微信是为了
+	// 一眼知道「这轮跑完，现在多少分」，多写反而要滑屏。
 	var b strings.Builder
-	fmt.Fprintf(&b, "任务：%s\n", n.Label)
-	if n.Account != "" {
-		fmt.Fprintf(&b, "账号：%s\n", accountLabelForNotify(s, n.Account))
+	// 换行用 LF 常量拼接，不在源码里写转义字符 —— 这个文件曾被脚本改坏过，
+	// 反斜杠 n 被吞成真实换行导致语法错误。
+	b.WriteString(n.Label)
+	b.WriteString(" ")
+	b.WriteString(status)
+	b.WriteString(LF)
+	if total, ok := s.pushBeansSummary(n); ok {
+		fmt.Fprintf(&b, "积分：%d", total)
+		b.WriteString(LF)
 	}
-	fmt.Fprintf(&b, "结果：%s\n", status)
-	fmt.Fprintf(&b, "耗时：%s\n", n.Elapsed.Round(time.Second))
-
-	// 逐条步骤 / 逐账号结果
-	if n.Result != nil {
-		if msg, _ := n.Result["msg"].(string); msg != "" {
-			fmt.Fprintf(&b, "摘要：%s\n", msg)
-		}
-		if lines, ok := n.Result["lines"].([]string); ok && len(lines) > 0 {
-			fmt.Fprintf(&b, "\n明细：\n")
-			for _, l := range lines {
-				fmt.Fprintf(&b, "  %s\n", l)
-			}
-		}
-		if steps, ok := n.Result["steps"].([]map[string]any); ok && len(steps) > 0 {
-			fmt.Fprintf(&b, "\n步骤：\n")
-			for _, st := range steps {
-				mark := "✓"
-				if okv, _ := st["ok"].(bool); !okv {
-					mark = "✗"
-				}
-				nm, _ := st["name"].(string)
-				sm, _ := st["msg"].(string)
-				fmt.Fprintf(&b, "  %s %s：%s\n", mark, nm, clipStr(sm, 100))
-			}
-		}
-	}
+	fmt.Fprintf(&b, "耗时：%s", n.Elapsed.Round(time.Second))
+	b.WriteString(LF)
 	if n.ErrMsg != "" {
-		fmt.Fprintf(&b, "\n错误：%s\n", clipStr(n.ErrMsg, 200))
+		fmt.Fprintf(&b, "错误：%s", clipStr(n.ErrMsg, 120))
+		b.WriteString(LF)
 	}
-	fmt.Fprintf(&b, "\n时间：%s", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "时间：%s", time.Now().Format("01-02 15:04"))
 
-	title := fmt.Sprintf("【hwcloud】%s %s", n.Label, status)
+	title := fmt.Sprintf("【hwcloud】%s 积分 %s", n.Label, status)
+	if total, ok := s.pushBeansCacheGet(); ok {
+		title = fmt.Sprintf("【hwcloud】积分 %d（%s）", total, n.Label)
+	}
 	if err := sendPushPlus(cfg.Token, title, b.String(), cfg.Topic); err != nil {
 		svcLog("[pushplus] 推送失败（%s）：%v", event, err)
 		return
 	}
 	svcLog("[pushplus] 已推送（%s）：%s", event, title)
+}
+
+// pushWorthyTask 判断某类任务结束后是否值得推送。
+//
+// 只有「跑一轮会实打实加积分」的任务才推：
+//   daily / weekly / gallery-publish / cloud-practice  → 推
+//   keepalive / tasks / beans / session / check 等      → 不推
+//
+// 批量任务的名字是 startBatchJob 传进来的同一个 name（daily/weekly/...），
+// 所以这里按 name 判断即可，不用区分单账号还是全部账号。
+func pushWorthyTask(name string) bool {
+	switch name {
+	case "daily", "weekly", "gallery-publish", "cloud-practice", "harmony-star-run":
+		return true
+	}
+	return false
+}
+
+// pushBeansSummary 汇总本次任务涉及账号的积分总数。
+//
+// 单个账号任务：直接读该账号积分。
+// 全部账号任务（Account == "all"）：累加所有账号。
+//
+// 用带 60 秒缓存的 probeAccount 系列方法，避免刚跑完任务又打一轮接口
+// —— 华为云的积分接口对高频请求不友好（实测连续查会限流）。
+func (s *Server) pushBeansSummary(n *jobNotify) (int, bool) {
+	if n.Account != "" && n.Account != batchAllID {
+		if snap, ok := s.cachedProbe(n.Account); ok && snap.Beans >= 0 {
+			return snap.Beans, true
+		}
+		return 0, false
+	}
+	// 全部账号：累加
+	total := 0
+	any := false
+	for _, a := range s.store.List() {
+		if snap, ok := s.cachedProbe(a.ID); ok && snap.Beans >= 0 {
+			total += snap.Beans
+			any = true
+		}
+	}
+	return total, any
+}
+
+// pushBeansCacheGet 取「全部账号」的缓存积分总数，用于标题。
+// 取不到就返回 false，标题退化成不带数字的版本。
+func (s *Server) pushBeansCacheGet() (int, bool) {
+	total := 0
+	any := false
+	for _, a := range s.store.List() {
+		if snap, ok := s.cachedProbe(a.ID); ok && snap.Beans >= 0 {
+			total += snap.Beans
+			any = true
+		}
+	}
+	return total, any
 }
 
 // accountLabelForNotify 把账号 ID 换成「备注(手机号)」，没有备注就用手机号。

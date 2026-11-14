@@ -45,6 +45,10 @@ type pushPlusEvents struct {
 	LoginExpired bool `json:"login_expired"`
 }
 
+// LF 是换行常量。用常量而不是直接写字面量，
+// 避免外部脚本处理转义时把反斜杠吃掉（本项目踩过两次）。
+const LF = string(rune(10))
+
 var (
 	pushCfgMu sync.RWMutex
 	pushCfg   *pushPlusConfig
