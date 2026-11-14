@@ -1767,7 +1767,6 @@ async function loadPushConfig(){
     $('pushEnabled').checked = !!d.enabled;
     $('pushEvDone').checked = !!(d.events && d.events.task_done);
     $('pushEvFail').checked = !!(d.events && d.events.task_fail);
-    $('pushEvLogin').checked = !!(d.events && d.events.login_expired);
     const tk = $('pushToken');
     if(d.has_token){
       tk.value = '';
@@ -1797,7 +1796,6 @@ function pushPayload(extra){
     events: {
       task_done: $('pushEvDone').checked,
       task_fail: $('pushEvFail').checked,
-      login_expired: $('pushEvLogin').checked,
     },
   }, extra || {});
 }

@@ -78,7 +78,9 @@
     <div class="sub" style="margin-bottom:12px">
       使用 <a href="https://www.pushplus.plus" target="_blank" rel="noopener">PushPlus</a>：
       微信扫码登录后复制 token 填在下面即可。token 只存在本机
-      <code>state/pushplus.json</code>，不会上传到任何地方。
+      <code>state/pushplus.json</code>，不会上传到任何地方。<br>
+      只有会加积分的任务（日常 / 周常 / 展览馆发布等）结束后推送，
+      <b>保活、检查这类不推送</b>；内容为各账号积分明细。
     </div>
 
     <div class="item">
@@ -99,11 +101,8 @@
         <label style="margin-right:14px">
           <input type="checkbox" id="pushEvDone" checked> 任务完成
         </label>
-        <label style="margin-right:14px">
-          <input type="checkbox" id="pushEvFail" checked> 任务失败
-        </label>
         <label>
-          <input type="checkbox" id="pushEvLogin" checked> 会话失效需重登
+          <input type="checkbox" id="pushEvFail" checked> 任务失败
         </label>
       </span>
     </div>

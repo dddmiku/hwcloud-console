@@ -1323,19 +1323,35 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 		return
 	}
 
-	// 正文只报积分总数 —— 任务细节面板上看得到，推送到微信是为了
-	// 一眼知道「这轮跑完，现在多少分」，多写反而要滑屏。
+	// 正文只报积分，不带任务步骤明细 —— 细节面板上看得到，
+	// 推送到微信是为了「跑完一眼知道每个号多少分」。
+	// 多账号时逐行列出并给合计；单账号就只一行。
+	beanLines, beanTotal, beanAny := s.pushBeanLines(n)
+
 	var b strings.Builder
-	// 换行用 LF 常量拼接，不在源码里写转义字符 —— 这个文件曾被脚本改坏过，
-	// 反斜杠 n 被吞成真实换行导致语法错误。
+	// 换行用 LF 常量拼接，不在源码里写转义（外部脚本处理时会吞反斜杠）。
 	b.WriteString(n.Label)
 	b.WriteString(" ")
 	b.WriteString(status)
 	b.WriteString(LF)
-	if total, ok := s.pushBeansSummary(n); ok {
-		fmt.Fprintf(&b, "积分：%d", total)
+
+	// 逐账号积分：一行一个，最后给总数
+	for _, bl := range beanLines {
+		b.WriteString("  ")
+		b.WriteString(bl.Label)
+		b.WriteString("：")
+		if bl.OK {
+			fmt.Fprintf(&b, "%d", bl.Beans)
+		} else {
+			b.WriteString("—")
+		}
 		b.WriteString(LF)
 	}
+	if len(beanLines) > 1 && beanAny {
+		fmt.Fprintf(&b, "  合计：%d", beanTotal)
+		b.WriteString(LF)
+	}
+
 	fmt.Fprintf(&b, "耗时：%s", n.Elapsed.Round(time.Second))
 	b.WriteString(LF)
 	if n.ErrMsg != "" {
@@ -1345,8 +1361,12 @@ func (s *Server) notifyJobDone(n *jobNotify) {
 	fmt.Fprintf(&b, "时间：%s", time.Now().Format("01-02 15:04"))
 
 	title := fmt.Sprintf("【hwcloud】%s 积分 %s", n.Label, status)
-	if total, ok := s.pushBeansCacheGet(); ok {
-		title = fmt.Sprintf("【hwcloud】积分 %d（%s）", total, n.Label)
+	if beanAny {
+		if len(beanLines) == 1 {
+			title = fmt.Sprintf("【hwcloud】%s 积分 %d", beanLines[0].Label, beanLines[0].Beans)
+		} else {
+			title = fmt.Sprintf("【hwcloud】积分合计 %d（%s）", beanTotal, n.Label)
+		}
 	}
 	if err := sendPushPlus(cfg.Token, title, b.String(), cfg.Topic); err != nil {
 		svcLog("[pushplus] 推送失败（%s）：%v", event, err)
@@ -1371,44 +1391,85 @@ func pushWorthyTask(name string) bool {
 	return false
 }
 
-// pushBeansSummary 汇总本次任务涉及账号的积分总数。
-//
-// 单个账号任务：直接读该账号积分。
-// 全部账号任务（Account == "all"）：累加所有账号。
-//
-// 用带 60 秒缓存的 probeAccount 系列方法，避免刚跑完任务又打一轮接口
-// —— 华为云的积分接口对高频请求不友好（实测连续查会限流）。
-func (s *Server) pushBeansSummary(n *jobNotify) (int, bool) {
-	if n.Account != "" && n.Account != batchAllID {
-		if snap, ok := s.cachedProbe(n.Account); ok && snap.Beans >= 0 {
-			return snap.Beans, true
-		}
-		return 0, false
-	}
-	// 全部账号：累加
-	total := 0
-	any := false
-	for _, a := range s.store.List() {
-		if snap, ok := s.cachedProbe(a.ID); ok && snap.Beans >= 0 {
-			total += snap.Beans
-			any = true
-		}
-	}
-	return total, any
+// beanLine 是推送里「一个账号一行」的数据。
+type beanLine struct {
+	Label string // 备注(手机号) 或 手机号
+	Beans int
+	OK    bool // false 表示取不到积分（离线/接口失败）
 }
 
-// pushBeansCacheGet 取「全部账号」的缓存积分总数，用于标题。
-// 取不到就返回 false，标题退化成不带数字的版本。
-func (s *Server) pushBeansCacheGet() (int, bool) {
-	total := 0
-	any := false
+// pushBeanLines 返回本次任务涉及账号的积分明细。
+//
+// 单个账号任务：只返回该账号一行。
+// 全部账号任务（Account == "all"）：返回每个账号一行，外加总数。
+//
+// 取不到积分的账号（离线/接口失败）标记 OK=false，正文里显示「—」，
+// 不参与总数 —— 显示 0 会让人误以为积分归零。
+func (s *Server) pushBeanLines(n *jobNotify) (lines []beanLine, total int, anyOK bool) {
+	if n.Account != "" && n.Account != batchAllID {
+		label := accountLabelForNotify(s, n.Account)
+		if beans, ok := s.beansForNotify(n.Account); ok {
+			return []beanLine{{Label: label, Beans: beans, OK: true}}, beans, true
+		}
+		return []beanLine{{Label: label, OK: false}}, 0, false
+	}
+	// 全部账号：逐个列
 	for _, a := range s.store.List() {
-		if snap, ok := s.cachedProbe(a.ID); ok && snap.Beans >= 0 {
-			total += snap.Beans
-			any = true
+		label := a.ID
+		if a.Remark != "" {
+			label = a.Remark
+		}
+		if beans, ok := s.beansForNotify(a.ID); ok {
+			lines = append(lines, beanLine{Label: label, Beans: beans, OK: true})
+			total += beans
+			anyOK = true
+		} else {
+			lines = append(lines, beanLine{Label: label, OK: false})
 		}
 	}
-	return total, any
+	return lines, total, anyOK
+}
+
+// beansForNotify 取某账号的积分，优先用缓存，缓存没有就现查一次。
+//
+// 为什么要现查：面板刚启动或用户没点过「刷新」时，probeCache 是空的，
+// 直接读缓存会得到一堆 -1，推送里全是「—」，等于没通知。
+//
+// 为什么用 withAccountTry 而不是 withAccount：
+//   推送是在 finishJob 之后异步跑的，此时任务已结束、锁应该空闲；
+//   但万一有别的账号在跑长任务，这里不能干等 —— 拿不到锁就当查不到，
+//   显示「—」比把推送卡住几十秒好。
+func (s *Server) beansForNotify(id string) (int, bool) {
+	if snap, ok := s.cachedProbe(id); ok && snap.Beans >= 0 {
+		return snap.Beans, true
+	}
+	var beans int
+	got := false
+	ok := s.withAccountTry(id, func() any {
+		sess, err := huawei.New("")
+		if err != nil {
+			return nil
+		}
+		if n, err := sess.BeansE(); err == nil {
+			beans = n
+			got = true
+		}
+		return nil
+	})
+	if !ok || !got {
+		return 0, false
+	}
+	// 顺手写回缓存，面板下次刷新能直接用
+	s.probeMu.Lock()
+	if s.probeCache == nil {
+		s.probeCache = map[string]probeSnapshot{}
+	}
+	snap := s.probeCache[id]
+	snap.Beans = beans
+	snap.At = time.Now()
+	s.probeCache[id] = snap
+	s.probeMu.Unlock()
+	return beans, true
 }
 
 // accountLabelForNotify 把账号 ID 换成「备注(手机号)」，没有备注就用手机号。
@@ -1770,6 +1831,19 @@ func (s *Server) startBatchJob(name string) (*jobState, error) {
 }
 
 // clipStr 按 rune 截断字符串（避免切坏中文）。
+// lenAnySlice 取任意 slice 的长度，用于日志里统计尝试次数。
+func lenAnySlice(v any) int {
+	switch x := v.(type) {
+	case []map[string]any:
+		return len(x)
+	case []any:
+		return len(x)
+	case []string:
+		return len(x)
+	}
+	return 0
+}
+
 func clipStr(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
@@ -4064,9 +4138,18 @@ func (s *Server) runDaily() map[string]any {
 		// 早先这里只记一句「核验未通过」，日志里看不到 missing/failed 是什么，
 		// 排查只能靠猜 —— 实测就是靠重试才发现是华为云侧同步 GitCode
 		// star 状态有延迟（missing 里带着 org:harmony-practice-center）。
-		svcLog("[daily] 鸿蒙Star核验未通过: missing=%v failed=%v attempts=%v",
-			res["missing"], res["failed"], res["check_attempts"])
+		// 打完整的失败原因，不要只 print 三个 %v。
+		//
+		// 2026-11-14 踩过：日志只写 "missing=<nil> failed=<nil> attempts=<nil>"，
+		// 完全看不出是「没 star 成功」还是「star 了但核验没同步」，
+		// 排查要重新翻代码。这里把 reason/msg/tried 一起打出来。
+		svcLog("[daily] 鸿蒙Star未完成: reason=%v msg=%v missing=%v failed=%v check_attempts=%v tried=%d",
+			res["reason"], res["msg"], res["missing"], res["failed"],
+			res["check_attempts"], lenAnySlice(res["tried"]))
 		msg := "核验未通过"
+		if s, ok := res["msg"].(string); ok && s != "" {
+			msg = s
+		}
 		if m, ok := res["missing"].([]string); ok && len(m) > 0 {
 			msg = fmt.Sprintf("核验未通过（缺少 %v）", m)
 		}

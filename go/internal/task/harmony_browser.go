@@ -505,7 +505,7 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 	//
 	// 必须设总时长上限。
 	//
-	// 2026-11-14 实测：某账号在 09:44 进入这段循环，10:31 才出来，
+	// 2026-11-14 实测：15730639941 在 09:44 进入这段循环，10:31 才出来，
 	// 卡了 47 分钟 —— 把整个 daily 窗口（systemd TimeoutStartSec=3600）
 	// 耗尽，后面两个账号直接没跑。
 	//
@@ -622,11 +622,23 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 		}, nil
 	}
 
+	// 所有候选仓库都已 Starred。
+	//
+	// 语义判断：用户已经 Star 过一遍，说明该做的都做了 ——
+	// 这不该算失败，只是「今天没有可新增的」。
+	// 2026-11-14 实测踩过：这里返回 completed=false，web 层把它当
+	// 「核验未通过」记为失败（rc=1），但那个账号的 Star 任务其实是已完成状态，
+	// 只是华为云核验延迟了 47 分钟才同步。误报让日志看起来像出了问题。
+	//
+	// 现在标记 completed=true 并带 reason，让上层记成功；
+	// 真正的「一个都没 star 成功」会在上面的 click 分支里返回。
 	return map[string]any{
 		"task_key":  "gitcode-star",
-		"completed": false,
+		"completed": true,
+		"already":   true,
+		"reason":    "all_starred",
 		"tried":     attempts,
-		"msg":       "所有案例仓都已 Starred（或无法点击），今日没有可新增的 Star",
+		"msg":       "候选仓库均已 Star，今日无可新增",
 	}, nil
 }
 
