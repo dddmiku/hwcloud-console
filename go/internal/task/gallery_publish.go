@@ -698,10 +698,17 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 	}
 
 	// 1) 找到展览馆任务卡片，点它的「去完成」
+	//
+	// 2026-11-26 修正：不能只在「含标题的最小元素」里找按钮。
+	// 新站卡片结构是 task-card > card-body（标题+积分）+ footer（去完成），
+	// 最小匹配元素是 card-body —— 里面根本没有按钮，
+	// 四个账号全部报「未找到入口（页面 3605 字）」（GalleryClickProbe 实证）。
+	// 现在改成：先找含标题的最小元素，点不到按钮就**向上遍历父级**，
+	// 在第一个同时含标题和「去完成」的祖先里点。
 	clicked := false
 	for round := 0; round < 3 && !clicked; round++ {
 		res, _ := page.Evaluate(`() => {
-			// 在所有元素里找「包含任务标题 + 去完成 按钮」的最小卡片
+			// 在所有元素里找「包含任务标题」的最小可见元素
 			let best = null, bestArea = 1e18;
 			for (const e of document.querySelectorAll('*')) {
 				const t = e.innerText || '';
@@ -712,23 +719,29 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 				if (area < bestArea) { bestArea = area; best = e; }
 			}
 			if (!best) return {ok:false, reason:'card-not-found'};
-			for (const b of best.querySelectorAll('button,a,div,span')) {
-				if ((b.innerText||'').trim() !== '去完成') continue;
-				const r = b.getBoundingClientRect();
-				if (r.width < 20 || r.height < 12) continue;
-				b.scrollIntoView({block:'center'});
-				b.click();
-				return {ok:true, x:Math.round(r.x), y:Math.round(r.y)};
+			// 在 best 及其祖先链上找「去完成」按钮（祖先必须仍然含标题，
+			// 防止扩到整个页面把别的任务的按钮点掉）
+			let scope = best;
+			for (let hop = 0; hop < 6 && scope; hop++) {
+				for (const b of scope.querySelectorAll('button,a,div,span')) {
+					if ((b.innerText||'').trim() !== '去完成') continue;
+					const r = b.getBoundingClientRect();
+					if (r.width < 20 || r.height < 12) continue;
+					b.scrollIntoView({block:'center'});
+					b.click();
+					return {ok:true, x:Math.round(r.x), y:Math.round(r.y), hop: hop};
+				}
+				scope = scope.parentElement;
 			}
-			return {ok:false, reason:'button-not-found'};
+			return {ok:false, reason:'button-not-found', bestTag: best.tagName, bestCls: (best.className||'').toString().slice(0,50)};
 		}`)
 		if m, ok := res.(map[string]any); ok {
 			if asBool(m["ok"]) {
 				clicked = true
-				logStep("  已点任务「去完成」")
+				logStep("  已点任务「去完成」（父级跳数 %v）", m["hop"])
 				break
 			}
-			logStep("  未找到入口: %v", m["reason"])
+			logStep("  未找到入口: %v（卡片 %v.%v）", m["reason"], m["bestTag"], m["bestCls"])
 		}
 		page.WaitForTimeout(4000)
 	}
@@ -1044,6 +1057,191 @@ func GrowNewPageProbe() (map[string]any, error) {
 	return out, nil
 }
 
+// GalleryClickProbe 只读诊断：复刻 navigateFromGrowthCenter 的卡片查找
+// 逻辑（不真点），打印每个候选卡片的尺寸和内层按钮，定位
+// 「页面有卡片却点不中」时的过滤条件问题。
+func GalleryClickProbe() (map[string]any, error) {
+	out := map[string]any{"account": config.AccountID()}
+
+	pw, err := playwright.Run()
+	if err != nil {
+		return out, fmt.Errorf("启动 playwright 失败: %v", err)
+	}
+	defer pw.Stop()
+
+	acct := config.AccountID()
+	profile, port := galleryProfileFor(acct)
+	defer closeGalleryBrowser(port)
+	if err := ensureGalleryBrowser(profile, port); err != nil {
+		return out, err
+	}
+	br, err := pw.Chromium.ConnectOverCDP("http://127.0.0.1:" + port)
+	if err != nil {
+		return out, fmt.Errorf("CDP 连接失败: %v", err)
+	}
+	defer br.Close()
+
+	ctx := br.Contexts()[0]
+	pages := ctx.Pages()
+	for i := len(pages) - 1; i >= 1; i-- {
+		_ = pages[i].Close()
+	}
+	page := pages[0]
+	if _, err := page.Goto(huawei.GrowBase+"/",
+		playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+			Timeout:   playwright.Float(90000),
+		}); err != nil {
+		return out, fmt.Errorf("打开新成长中心失败: %v", err)
+	}
+	for i := 0; i < 7; i++ {
+		page.WaitForTimeout(6000)
+		body, _ := page.Locator("body").InnerText()
+		if strings.Contains(body, "发布作品") {
+			break
+		}
+	}
+
+	// 复刻生产逻辑：找含标题的最小卡片 + 它内部的「去完成」，
+	// 但把每个候选的宽高都记下来，看是不是被 width/height 过滤掉了
+	info, err := page.Evaluate(`() => {
+		const res = {candidates: [], buttonsInBest: null};
+		let best = null, bestArea = 1e18;
+		for (const e of document.querySelectorAll('*')) {
+			const t = e.innerText || '';
+			if (t.indexOf('在开发者作品展览馆中发布作品') < 0) continue;
+			const r = e.getBoundingClientRect();
+			res.candidates.push({
+				tag: e.tagName, cls: (e.className||'').toString().slice(0,60),
+				w: Math.round(r.width), h: Math.round(r.height),
+				passes: (r.width >= 150 && r.width <= 1200 && r.height >= 40),
+			});
+			if (r.width < 150 || r.width > 1200 || r.height < 40) continue;
+			const area = r.width * r.height;
+			if (area < bestArea) { bestArea = area; best = e; }
+		}
+		if (best) {
+			res.buttonsInBest = [];
+			for (const b of best.querySelectorAll('button,a,div,span')) {
+				const t = (b.innerText||'').trim();
+				if (!t) continue;
+				const r = b.getBoundingClientRect();
+				res.buttonsInBest.push({text: t.slice(0,20), tag: b.tagName, w: Math.round(r.width), h: Math.round(r.height)});
+			}
+			res.buttonsInBest = res.buttonsInBest.slice(0, 20);
+		}
+		res.candidates = res.candidates.slice(0, 30);
+		return res;
+	}`)
+	if err != nil {
+		out["eval_err"] = err.Error()
+	} else if m, ok := info.(map[string]any); ok {
+		out["candidates"] = m["candidates"]
+		out["buttonsInBest"] = m["buttonsInBest"]
+	}
+	return out, nil
+}
+
+// GalleryShellPeek 只读诊断：连上热情号正在跑的 DevSpace 会话，
+// 把 AI Shell 当前的可见文本拉出来（前 2500 字），看 AI 卡在哪一步。
+// 只读，不发消息、不点任何东西。
+func GalleryShellPeek() (map[string]any, error) {
+	out := map[string]any{"account": config.AccountID()}
+	acct := config.AccountID()
+	_, port := galleryProfileFor(acct)
+
+	// 浏览器必须是活的（gallery-publish 任务可能还在跑）
+	if ok, _ := runLocal("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+		"--max-time", "3", "http://127.0.0.1:"+port+"/json/version"); strings.TrimSpace(ok) != "200" {
+		out["browser"] = "closed"
+		return out, nil
+	}
+	out["browser"] = "alive port=" + port
+
+	pw, err := playwright.Run()
+	if err != nil {
+		return out, err
+	}
+	defer pw.Stop()
+	br, err := pw.Chromium.ConnectOverCDP("http://127.0.0.1:" + port)
+	if err != nil {
+		return out, err
+	}
+	defer br.Close()
+	ctx := br.Contexts()[0]
+	for _, p := range ctx.Pages() {
+		out["page_url"] = clip(p.URL(), 100)
+		if !strings.Contains(p.URL(), "devstation") {
+			continue
+		}
+		// 优先抓 aishell iframe（AI 对话在里面），抓不到再退回整页
+		for _, f := range p.Frames() {
+			if strings.Contains(f.URL(), "workspace.developer.huaweicloud.com") &&
+				strings.Contains(f.URL(), "/aishell") {
+				txt, _ := f.InnerText("body")
+				r := []rune(txt)
+				if len(r) > 2500 {
+					r = r[len(r)-2500:] // 取末尾（AI 最新输出在底部）
+				}
+				out["aishell_tail"] = string(r)
+				out["frame_url"] = clip(f.URL(), 100)
+				break
+			}
+		}
+		if _, ok := out["aishell_tail"]; !ok {
+			txt, _ := p.Locator("body").InnerText()
+			r := []rune(txt)
+			if len(r) > 2500 {
+				r = r[len(r)-2500:]
+			}
+			out["page_tail"] = string(r)
+		}
+		break
+	}
+	return out, nil
+}
+
+// GalleryShellReply 诊断用：往当前账号的 aishell 输入框发一条消息。
+// 供卡死会话的应急处理（如 AI 在等「新建/复用」二选一）。
+func GalleryShellReply(msg string) (map[string]any, error) {
+	out := map[string]any{"sent": false, "msg": msg}
+	acct := config.AccountID()
+	_, port := galleryProfileFor(acct)
+	if ok, _ := runLocal("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+		"--max-time", "3", "http://127.0.0.1:"+port+"/json/version"); strings.TrimSpace(ok) != "200" {
+		return out, fmt.Errorf("浏览器未运行（端口 %s）", port)
+	}
+	pw, err := playwright.Run()
+	if err != nil {
+		return out, err
+	}
+	defer pw.Stop()
+	br, err := pw.Chromium.ConnectOverCDP("http://127.0.0.1:" + port)
+	if err != nil {
+		return out, err
+	}
+	defer br.Close()
+	ctx := br.Contexts()[0]
+	for _, p := range ctx.Pages() {
+		if !strings.Contains(p.URL(), "devstation") {
+			continue
+		}
+		for _, f := range p.Frames() {
+			if !(strings.Contains(f.URL(), "workspace.developer.huaweicloud.com") &&
+				strings.Contains(f.URL(), "/aishell")) {
+				continue
+			}
+			if err := sendToAIShell(p, f, msg); err != nil {
+				out["err"] = err.Error()
+				return out, err
+			}
+			out["sent"] = true
+			return out, nil
+		}
+	}
+	return out, fmt.Errorf("未找到 aishell iframe")
+}
+
 // dismissGalleryDialogs 处理 DevSpace 的四道开通/协议弹窗。
 func dismissGalleryDialogs(page playwright.Page) {
 	for round := 1; round <= 5; round++ {
@@ -1313,7 +1511,7 @@ func waitForInputIdle(page playwright.Page, shell playwright.Frame, deadline tim
 //
 // 现在要求：命中信号后，还要连续稳定 N 轮（约 1 分钟）才认定结束。
 func waitForSignal(page playwright.Page, shell playwright.Frame, signals []string, deadline time.Time) error {
-	baseline := len(frameTextOf(shell))
+	baselineText := frameTextOf(shell)
 	lastLog := time.Now()
 	hit := false
 	stable := 0
@@ -1322,9 +1520,18 @@ func waitForSignal(page playwright.Page, shell playwright.Frame, signals []strin
 		page.WaitForTimeout(8000)
 		dismissCWDialog(shell)
 		txt := frameTextOf(shell)
-		var fresh string
-		if len(txt) > baseline {
-			fresh = txt[baseline:]
+		// fresh 不能用长度切片：AI Shell 是虚拟滚动列表，DOM 只保留
+		// 近期消息，文本总长会在 ~15 万字符处封顶 —— 旧内容被裁掉后
+		// len(txt) 不再增长，而新消息（如「发布成功」）恰好落在被裁掉的
+		// 区间里，长度切片的 fresh 就漏掉了信号（2026-11-26 实测：
+		// 发布明明成功，等待循环到超时都没命中）。
+		// 改成内容后缀对齐：先假设 txt 是 baseline 的超集（尾部对齐），
+		// 找不到就用「baseline 尾部 200 字符」在 txt 里定位分界点。
+		fresh := txt
+		if i := strings.LastIndex(txt, tailOf(baselineText, 200)); i >= 0 {
+			fresh = txt[i:]
+		} else if len(txt) > len(baselineText) {
+			fresh = txt[len(baselineText):] // 兜底：老逻辑
 		}
 		busy := aiIsBusy(shell)
 
@@ -1813,6 +2020,15 @@ func clip(s string, n int) string {
 		return string(r[:n]) + "..."
 	}
 	return s
+}
+
+// tailOf 取字符串末尾 n 个 rune（不含省略号）。
+func tailOf(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
 }
 
 func logStep(format string, args ...any) {
